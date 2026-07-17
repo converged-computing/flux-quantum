@@ -1,0 +1,98 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Image with flux-core 0.87 + flux-sched@add-hold (provides `flux inject`, the
+# hold RPC, and qmanager). Override with the repo variable QUANTUM_FLUX_IMAGE
+# once an automated build publishes a new tag.
+env:
+  FLUX_IMAGE: ${{ vars.QUANTUM_FLUX_IMAGE || 'ghcr.io/converged-computing/fluxion-quantum:flux-base-ubuntu-test' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Pure-Python unit tests. No flux required. Token-free logic: backends,
+  # selector/ranking, mock gating, CLI-plugin discovery shim. Always runs.
+  # ---------------------------------------------------------------------------
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest flake8
+      - name: lint (syntax only)
+        run: flake8 flux_quantum --select=E9,F63,F7,F82 --show-source
+      - name: unit tests
+        run: pytest tests/unit -q
+
+  # ---------------------------------------------------------------------------
+  # Integration in the flux image (flux-core 0.87 + flux-sched@add-hold):
+  #   1. CLI plugin is discovered by flux submit
+  #   2. jobtap policy gate builds, loads, and accepts/rejects by vendor
+  #   3. full token-free end-to-end: registry (flux inject) -> hold/reserve ->
+  #      scout (mock session) -> rendezvous handoff -> job runs
+  # ---------------------------------------------------------------------------
+  integration:
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ vars.QUANTUM_FLUX_IMAGE || 'ghcr.io/converged-computing/fluxion-quantum:flux-base-ubuntu-test' }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install package into flux's python
+        run: |
+          flux python -m pip install -e . --break-system-packages \
+            || flux python -m pip install -e . \
+            || pip install -e . --break-system-packages \
+            || pip install -e .
+
+      - name: diagnostics
+        run: |
+          echo "== flux python =="; flux python -c "import sys; print(sys.executable)"
+          echo "== is flux_quantum importable by flux python? =="
+          flux python -c "import flux_quantum, flux_quantum.cli; print('OK:', flux_quantum.__file__)" \
+            || echo "NOT importable by flux python"
+          echo "== cli-plugins dir =="; ls -la cli-plugins
+
+      - name: CLI plugin is discovered
+        run: |
+          export FLUX_CLI_PLUGINPATH=$PWD/cli-plugins
+          flux start flux submit --help 2>&1 | grep -E 'quantum' \
+            || { echo "CLI plugin not discovered"; exit 1; }
+
+      - name: jobtap plugin builds
+        run: make -C flux_quantum/jobtap
+
+      - name: jobtap policy gate (load + accept/reject)
+        run: |
+          cat > /tmp/jt.sh <<'SH'
+          set -e
+          flux jobtap load $GITHUB_WORKSPACE/flux_quantum/jobtap/quantum.so vendors="ibm,braket"
+          flux submit --setattr=system.quantum.vendor=ibm -n1 true >/dev/null \
+            && echo "ACCEPT-ibm OK"
+          if flux submit --setattr=system.quantum.vendor=rigetti -n1 true >/dev/null 2>&1; then
+            echo "REJECT-rigetti FAILED"; exit 1
+          else echo "REJECT-rigetti OK"; fi
+          flux submit -n1 true >/dev/null && echo "ACCEPT-plain OK"
+          SH
+          flux start bash /tmp/jt.sh
+
+      - name: full token-free end-to-end (mock vendor)
+        run: |
+          export FLUX_QUANTUM_MOCK=1
+          flux start bash tests/integration/test-mock-e2e.sh
