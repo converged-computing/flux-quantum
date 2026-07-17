@@ -50,6 +50,10 @@ def main():
     if not cmd:
         print("quantum-wrap: QUANTUM_SESSION_ID={} (no command given)".format(session))
         return
+    # stderr so it shows in the job's output without interfering with the
+    # wrapped program's stdout; confirms the handoff reached this process.
+    sys.stderr.write(
+        "quantum-wrap: QUANTUM_SESSION_ID={} -> exec {}\n".format(session, " ".join(cmd)))
     os.execvp(cmd[0], cmd)
 
 
