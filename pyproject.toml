@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flux-quantum"
+version = "0.0.1"
+description = "Quantum + classical coscheduling components for Flux (CLI plugin, validator, jobtap, backends, scout)"
+requires-python = ">=3.8"
+# NOTE: interfaces (esp. flux.cli.plugin.CLIPlugin) are not yet stable across
+# flux-core releases. Developed/tested against flux-core 0.87.0. Pin to a
+# contemporaneous flux-core, per Flux packaging guidance.
+
+[project.urls]
+Homepage = "https://github.com/flux-framework"
+
+[tool.setuptools.packages.find]
+include = ["flux_quantum*"]
+
+# The CLI plugin is discovered by flux from a *.py in the CLI plugin search
+# path, NOT by normal import. Install/symlink flux_quantum/cli_plugin.py into
+# one of: {confdir}/cli/plugins, {libexecdir}/cli/plugins, or a dir on
+# FLUX_CLI_PLUGINPATH. See README (Install).
