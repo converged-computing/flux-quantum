@@ -115,3 +115,49 @@ def test_explicit_vendor_skips_discovery(stub_flux_cli, monkeypatch):
     plugin = cli.QuantumCLIPlugin("submit")
     plugin.preinit(_make_args(vendor="mock", select=None, rendezvous=None))
     assert plugin._chosen == "mock"
+
+
+class _FakeJS:
+    def __init__(self, resources):
+        self.jobspec = {"resources": resources, "attributes": {}}
+    def setattr(self, key, value):
+        d = self.jobspec.setdefault("attributes", {})
+        parts = key.split(".")
+        for p in parts[:-1]:
+            d = d.setdefault(p, {})
+        d[parts[-1]] = value
+    def getattr(self, key):
+        d = self.jobspec.get("attributes", {})
+        for p in key.split("."):
+            d = d[p]
+        return d
+
+
+def test_split_and_submit_makes_held_main_then_quantum_scout(stub_flux_cli):
+    """ONE path: split the user's jobspec into a held classical MAIN and a
+    classical+quantum SCOUT, and submit BOTH (main first, for its id)."""
+    import json
+    cli = importlib.import_module("flux_quantum.cli")
+
+    order = []
+    def fake_submit(handle, js):
+        order.append(js)
+        return len(order)                 # main -> 1, scout -> 2
+
+    main = _FakeJS([{"type": "slot", "with": [
+        {"type": "node", "count": 4, "with": [{"type": "core", "count": 8}]}]}])
+
+    main_id, scout_id = cli.split_and_submit(
+        None, main, "ibm", "/tmp/rdv", submit_fn=fake_submit)
+
+    assert (main_id, scout_id) == (1, 2)          # two jobs, main first
+    assert order[0] is main
+    assert main.getattr("system.hold") == 1        # main held classical
+    assert main.getattr("system.quantum.vendor") == "ibm"
+    scout = json.loads(order[1])                   # scout classical + quantum
+    rtypes = [r["type"] for r in scout["resources"]]
+    assert "node" in rtypes and "qvendor_ibm" in rtypes    # two top-level resources
+    node = next(r for r in scout["resources"] if r["type"] == "node")
+    slot = next(c for c in node["with"] if c["type"] == "slot")
+    assert any(c["type"] == "core" for c in slot["with"])
+    assert "1" in " ".join(scout["tasks"][0]["command"])   # references main id

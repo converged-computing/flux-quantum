@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 ##############################################################
-# Build an add-subgraph payload that plants qvendor_* markers under the LIVE
-# graph root, for token-free registry / discovery testing.
+# Build an add-subgraph payload that plants qvendor_* -> qpu subtrees under the
+# LIVE graph root: each vendor vertex carries a qpu child so a job can request
+# qvendor_<v> -> qpu and fluxion co-allocates it (the scout coschedule match).
+# Also serves token-free registry / discovery (the qvendor_* vertex).
 #
 # fluxion's JGF reader (resource_reader_jgf) matches existing vertices by
 # (containment path, rank) and requires only id + metadata.type +
@@ -41,6 +43,8 @@ def main():
     p = argparse.ArgumentParser(prog="subgraph.py")
     p.add_argument("--vendor", action="append", default=[],
                    help="vendor name -> qvendor_<name> marker (repeatable)")
+    p.add_argument("--qpus", type=int, default=1,
+                   help="qpu vertices under each vendor (default 1)")
     p.add_argument("--input", dest="ifn", metavar="FILENAME")
     p.add_argument("--output", dest="ofn", metavar="FILENAME")
     args = p.parse_args()
@@ -56,21 +60,37 @@ def main():
 
     nodes = [root]   # verbatim: matched by (path, rank); enters vmap, not dup'd
     edges = []
-    for i, v in enumerate(args.vendor):
-        vid = str(max_id + 1 + i)
+    next_id = max_id + 1
+    for v in args.vendor:
+        vid = str(next_id); next_id += 1
         vtype = "qvendor_%s" % v
-        name = vtype + "0"
+        vname = vtype + "0"
+        vpath = "%s/%s" % (root_path, vname)
         nodes.append({
             "id": vid,
             "metadata": {
                 "type": vtype,
                 "rank": -1,
-                "paths": {"containment": "%s/%s" % (root_path, name)},
+                "paths": {"containment": vpath},
                 "properties": {v: ""},
             },
         })
         edges.append({"source": root_id, "target": vid,
                       "metadata": {"subsystem": "containment"}})
+        # qpu child(ren): a job requests qvendor_<v> -> qpu and matches here
+        for q in range(args.qpus):
+            qid = str(next_id); next_id += 1
+            nodes.append({
+                "id": qid,
+                "metadata": {
+                    "type": "qpu",
+                    "rank": -1,
+                    "paths": {"containment": "%s/qpu%d" % (vpath, q)},
+                    "properties": {v: ""},
+                },
+            })
+            edges.append({"source": vid, "target": qid,
+                          "metadata": {"subsystem": "containment"}})
 
     out = {"graph": {"nodes": nodes, "edges": edges}}
     outfile = open(args.ofn, "w") if args.ofn else sys.stdout

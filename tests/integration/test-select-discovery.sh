@@ -47,16 +47,27 @@ grep -q "selected: mock" "$ERR" \
     || echo "WARN: expected mock to be selected"
 
 echo ""
-echo "=== 4. full pipeline via auto-select: held -> scout -> handoff ==="
+echo "=== 4. full pipeline: SCOUT co-allocates core + qvendor_mock->qpu, unholds main ==="
 sleep 1
 st=$(flux jobs -no '{state}' "$cid" 2>/dev/null)
 echo "state (expect SCHED, i.e. held): $st"
-flux run -n1 flux python "$HERE/flux_quantum/scout.py" \
-        --job "$cid" --rendezvous "$RDV" --vendor mock --session AUTOSESS456 </dev/null
+# The scout is now a real job that REQUESTS classical + quantum (slot -> [core,
+# qvendor_mock->qpu]); fluxion must match it against the injected graph before it
+# can run, open the (mock) session, and unhold the main. A bare `flux run -n1`
+# would not exercise the quantum match at all.
+scout_id=$(flux python "$HERE/flux_quantum/launch.py" \
+        --job "$cid" --rendezvous "$RDV" --vendor mock --session AUTOSESS456)
+echo "scout submitted (requests core + qvendor_mock->qpu): $scout_id"
+if ! flux job wait-event -t 20 "$scout_id" clean </dev/null; then
+    echo "FAIL: scout never ran -- the core+qpu coschedule match failed"
+    flux job attach "$scout_id" 2>&1 | sed 's/^/    /'
+    exit 1
+fi
+echo "PASS: scout matched core + qvendor_mock->qpu and ran"
 flux job wait-event -t 20 "$cid" clean </dev/null
 out=$(flux job attach "$cid" </dev/null 2>&1)
 echo "$out" | grep -q "AUTOSESS456" \
-    && echo "PASS: auto-selected job ran with handed-off session (AUTOSESS456)" \
+    && echo "PASS: main ran with handed-off session (AUTOSESS456)" \
     || { echo "FAIL: session not observed"; echo "--- output ---"; echo "$out"; }
 
 rm -rf "$RDV" "$ERR"

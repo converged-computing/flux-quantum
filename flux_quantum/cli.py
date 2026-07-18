@@ -27,9 +27,39 @@ from flux.cli.plugin import CLIPlugin
 
 from .selector import select_vendor, SelectionError
 from .backends import get_backend
+from .launch import build_scout_jobspec
 
 #: subcommands where quantum submission makes sense
 _ACTIVE_PROGS = ("submit", "run", "batch", "bulksubmit", "alloc")
+
+
+def split_and_submit(handle, jobspec, vendor, rendezvous,
+                     scout_cores=1, submit_fn=None):
+    """THE submission path: take the user's jobspec, split it into a held
+    classical MAIN and a classical+quantum SCOUT, and submit BOTH.
+
+    Returns (main_id, scout_id). The user's jobspec is the classical work: we
+    stamp + hold it as the MAIN, then assemble the SCOUT (a small core AND the
+    vendor's device, qvendor_<vendor> -> qpu, via build_scout_jobspec) that opens
+    the session and unholds the MAIN.
+
+    Order is fixed, not a design choice: the MAIN is submitted first because the
+    SCOUT must reference the MAIN's id -- it fires the unhold RPC on it and keys
+    the rendezvous file to it.
+    """
+    import json
+    if submit_fn is None:
+        from flux.job import submit as submit_fn
+    # MAIN: the user's classical work, held + reserved-first.
+    jobspec.setattr("system.quantum.vendor", vendor)
+    if rendezvous:
+        jobspec.setattr("system.quantum.rendezvous", rendezvous)
+    jobspec.setattr("system.hold", 1)
+    main_id = submit_fn(handle, jobspec)
+    # SCOUT: classical foothold + the vendor's qpu; unholds the MAIN when live.
+    scout = build_scout_jobspec(vendor, rendezvous or "", main_id, ncores=scout_cores)
+    scout_id = submit_fn(handle, json.dumps(scout))
+    return main_id, scout_id
 
 
 class QuantumCLIPlugin(CLIPlugin):
