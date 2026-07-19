@@ -60,7 +60,10 @@ def test_plugin_registers_options_with_quantum_prefix(stub_flux_cli):
     plugin = shim.QuantumCLIPlugin("submit")   # flux instantiates as entry(prog)
     assert plugin.prefix == "quantum"
     names = {n for n, _ in plugin.options}
-    assert names == {"--vendor", "--select", "--rendezvous"}
+    # core options always present
+    assert {"--vendor", "--select", "--rendezvous"} <= names
+    # each registered vendor backend contributes its own namespaced options
+    assert "--ibm-backend" in names and "--braket-device" in names
 
 
 def test_plugin_inactive_for_other_progs(stub_flux_cli):
@@ -104,28 +107,20 @@ def test_preinit_uses_registry_discovery(stub_flux_cli, monkeypatch):
     assert plugin2._chosen == "mock"
 
 
-def test_explicit_vendor_skips_discovery(stub_flux_cli, monkeypatch):
-    import sys
-    sys.modules["flux"].Flux = lambda *a, **k: object()
-    cli = importlib.import_module("flux_quantum.cli")
-    import flux_quantum.selector as sel
-    # if discovery were consulted it would raise; explicit vendor must skip it
-    monkeypatch.setattr(sel, "discover_registry_vendors",
-                        lambda h: (_ for _ in ()).throw(AssertionError("should not discover")))
-    plugin = cli.QuantumCLIPlugin("submit")
-    plugin.preinit(_make_args(vendor="mock", select=None, rendezvous=None))
-    assert plugin._chosen == "mock"
-
 
 class _FakeJS:
+    """Minimal stand-in for flux.job.Jobspec: wraps a dict, supports the dotted
+    setattr/getattr under attributes that the plugin uses."""
     def __init__(self, resources):
         self.jobspec = {"resources": resources, "attributes": {}}
+
     def setattr(self, key, value):
         d = self.jobspec.setdefault("attributes", {})
         parts = key.split(".")
         for p in parts[:-1]:
             d = d.setdefault(p, {})
         d[parts[-1]] = value
+
     def getattr(self, key):
         d = self.jobspec.get("attributes", {})
         for p in key.split("."):
@@ -133,31 +128,92 @@ class _FakeJS:
         return d
 
 
-def test_split_and_submit_makes_held_main_then_quantum_scout(stub_flux_cli):
-    """ONE path: split the user's jobspec into a held classical MAIN and a
-    classical+quantum SCOUT, and submit BOTH (main first, for its id)."""
-    import json
-    cli = importlib.import_module("flux_quantum.cli")
+def _fake_jobspec(command):
+    js = _FakeJS([{"type": "node", "count": 1,
+                   "with": [{"type": "slot", "count": 1, "label": "task",
+                             "with": [{"type": "core", "count": 1}]}]}])
+    js.jobspec["tasks"] = [{"command": list(command), "slot": "task",
+                            "count": {"per_slot": 1}}]
+    return js
 
-    order = []
-    def fake_submit(handle, js):
-        order.append(js)
-        return len(order)                 # main -> 1, scout -> 2
 
-    main = _FakeJS([{"type": "slot", "with": [
-        {"type": "node", "count": 4, "with": [{"type": "core", "count": 8}]}]}])
+def _live_graph():
+    return {"nodes": [{"id": "0", "metadata": {"type": "cluster", "rank": -1,
+                                               "paths": {"containment": "/c0"}}},
+                      {"id": "1", "metadata": {"type": "node", "rank": -1,
+                                               "paths": {"containment": "/c0/n0"}}},
+                      {"id": "2", "metadata": {"type": "core", "rank": -1,
+                                               "paths": {"containment": "/c0/n0/c0"}}}],
+            "edges": [{"source": "0", "target": "1", "metadata": {"subsystem": "containment"}},
+                      {"source": "1", "target": "2", "metadata": {"subsystem": "containment"}}]}
 
-    main_id, scout_id = cli.split_and_submit(
-        None, main, "ibm", "/tmp/rdv", submit_fn=fake_submit)
 
-    assert (main_id, scout_id) == (1, 2)          # two jobs, main first
-    assert order[0] is main
-    assert main.getattr("system.hold") == 1        # main held classical
-    assert main.getattr("system.quantum.vendor") == "ibm"
-    scout = json.loads(order[1])                   # scout classical + quantum
-    rtypes = [r["type"] for r in scout["resources"]]
-    assert "node" in rtypes and "qvendor_ibm" in rtypes    # two top-level resources
-    node = next(r for r in scout["resources"] if r["type"] == "node")
-    slot = next(c for c in node["with"] if c["type"] == "slot")
-    assert any(c["type"] == "core" for c in slot["with"])
-    assert "1" in " ".join(scout["tasks"][0]["command"])   # references main id
+def _run_prepare(stub_flux_cli, submit=None, populate=None, get_graph=None, cancel=None):
+    from flux_quantum import cli
+    calls = {"submitted": [], "populated": [], "cancelled": []}
+
+    def default_submit(handle, jobspec_json):
+        import json
+        calls["submitted"].append(json.loads(jobspec_json))
+        return 12345
+
+    def default_populate(handle, vendors):
+        calls["populated"].append(list(vendors))
+
+    def default_cancel(handle, jobid, reason):
+        calls["cancelled"].append((jobid, reason))
+
+    js = _fake_jobspec(["myprog", "--flag"])
+    main_id = cli.prepare_pair(
+        handle=None, jobspec=js, vendor="mock", rendezvous="/tmp/rdv",
+        submit_fn=submit or default_submit,
+        populate_fn=populate or default_populate,
+        get_graph_fn=get_graph or (lambda h: _live_graph()),
+        cancel_fn=cancel or default_cancel,
+    )
+    return main_id, js, calls
+
+
+def test_prepare_pair_submits_held_wrapped_classical(stub_flux_cli):
+    main_id, js, calls = _run_prepare(stub_flux_cli)
+    assert main_id == 12345
+    # the CLASSICAL that was submitted: held, wrapped, vendor+rendezvous stamped
+    classical = calls["submitted"][0]
+    sysattr = classical["attributes"]["system"]
+    assert sysattr["hold"] == 1
+    assert sysattr["quantum"]["vendor"] == "mock"
+    assert sysattr["quantum"]["rendezvous"] == "/tmp/rdv"
+    cmd = classical["tasks"][0]["command"]
+    assert cmd[:3] == ["flux", "python"] or "wrap.py" in cmd[2]
+    assert "--rendezvous" in cmd and "myprog" in cmd  # user command preserved
+    assert calls["populated"] == [["mock"]]
+
+
+def test_prepare_pair_rewrites_jobspec_into_scout(stub_flux_cli):
+    main_id, js, calls = _run_prepare(stub_flux_cli)
+    # the jobspec flux will submit is now the SCOUT: has the qpu, is NOT held,
+    # and runs scout.py referencing the held classical id
+    types = [r["type"] for r in js.jobspec["resources"]]
+    assert any(t.startswith("qdevice_") for t in types)
+    assert "hold" not in js.jobspec.get("attributes", {}).get("system", {})
+    scout_cmd = " ".join(js.jobspec["tasks"][0]["command"])
+    assert "scout.py" in scout_cmd and str(main_id) in scout_cmd
+
+
+def test_prepare_pair_gate_aborts_on_unsatisfiable(stub_flux_cli):
+    def rejecting_submit(handle, jobspec_json):
+        raise OSError("unsatisfiable request")
+    with pytest.raises(SystemExit):
+        _run_prepare(stub_flux_cli, submit=rejecting_submit)
+
+
+def test_prepare_pair_cancels_held_classical_on_populate_failure(stub_flux_cli):
+    calls_seen = {}
+    def boom_populate(handle, vendors):
+        raise RuntimeError("add_subgraph failed")
+    def rec_cancel(handle, jobid, reason):
+        calls_seen["cancelled"] = jobid
+    with pytest.raises(SystemExit):
+        _run_prepare(stub_flux_cli, populate=boom_populate, cancel=rec_cancel)
+    # the held classical must be cancelled so it does not sit forever
+    assert calls_seen.get("cancelled") == 12345

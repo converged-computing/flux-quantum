@@ -212,5 +212,3 @@ RUN export EFA_VERSION=latest && \
 
 ENV PATH=/opt/amazon/openmpi/bin:$PATH
 ENV LD_LIBRARY_PATH=/opt/amazon/openmpi/lib:$LD_LIBRARY_PATH
-COPY flux-inject.py /usr/libexec/flux/cmd/flux-inject.py
-RUN chmod +x /usr/libexec/flux/cmd/flux-inject.py

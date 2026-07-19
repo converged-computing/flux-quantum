@@ -22,6 +22,29 @@ from .base import Backend, Signals, register
 class MockBackend(Backend):
     name = "mock"
 
+    @classmethod
+    def add_options(cls, add_option):
+        add_option("--mock-session", metavar="ID", default=None,
+                   help="mock: force this session id (testing)")
+        add_option("--mock-latency", metavar="SECONDS", default=None,
+                   help="mock: delay this many seconds before opening a session")
+
+    def scout_options(self, args):
+        return {
+            "session": getattr(args, "mock_session", None),
+            "latency": getattr(args, "mock_latency", None),
+        }
+
+    def open_session(self, options):
+        import time
+        latency = options.get("latency")
+        if latency:
+            time.sleep(float(latency))
+        forced = options.get("session")
+        if forced:
+            return forced
+        return "mock-session-{}-{}".format(int(time.time()), os.getpid())
+
     def credentials_present(self):
         return True, "mock: no credentials required"
 

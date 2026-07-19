@@ -1,7 +1,7 @@
 #!/bin/bash
 ##############################################################
 # Populate the LIVE fluxion graph with a token-free quantum vendor REGISTRY:
-# qvendor_* marker vertices the CLI plugin/selector discover via find (used by
+# qdevice_* marker vertices the CLI plugin/selector discover via find (used by
 # --quantum-select auto-pick). Markers are plain graph vertices added with
 # `flux ion-resource add-subgraph` -- no vendor API, no token.
 #
@@ -26,26 +26,22 @@ flux module remove -f sched-simple 2>/dev/null || true
 flux module load sched-fluxion-resource
 flux module load sched-fluxion-qmanager
 
-echo "-- dump the live graph (strip find's human banner) --"
-flux ion-resource find --format=jgf status=up | sed -n '/^{/,$p' > "$LIVE"
-head -c1 "$LIVE" | grep -q '{' || { echo "FAILED: no JSON from find"; cat "$LIVE"; exit 1; }
-
-echo "-- build the vendor-marker subgraph: $VENDORS --"
-vargs=()
-for v in $VENDORS; do vargs+=(--vendor "$v"); done
-flux python "$SELF/subgraph.py" --input "$LIVE" "${vargs[@]}" --output "$SUB"
-
-echo "-- grow the markers into the live graph (add-subgraph) --"
-flux ion-resource add-subgraph "$SUB"
+echo "-- populate qdevice_<vendor> -> qpu into the live graph (find + add_subgraph RPC) --"
+flux python -c "
+import flux
+from flux_quantum import graph
+added = graph.populate(flux.Flux(), \"\"\"$VENDORS\"\"\".split())
+print('added vendors:', sorted(added))
+"
 
 echo "-- verify markers are discoverable via find --"
 found=$(flux ion-resource find --format=jgf status=up | sed -n '/^{/,$p' \
-        | grep -oE 'qvendor_[a-z_]+' | sort -u | tr '\n' ' ')
+        | grep -oE 'qdevice_[a-z_]+' | sort -u | tr '\n' ' ')
 echo "discoverable vendor types: $found"
 for v in $VENDORS; do
     case " $found " in
-        *" qvendor_${v} "*) : ;;
-        *) echo "FAIL: qvendor_${v} not found in registry"; exit 1 ;;
+        *" qdevice_${v} "*) : ;;
+        *) echo "FAIL: qdevice_${v} not found in registry"; exit 1 ;;
     esac
 done
 echo "PASS: vendor registry present ($found)"
