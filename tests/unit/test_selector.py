@@ -52,8 +52,8 @@ def test_discover_registry_vendors_parses_jgf(backends_real):
     class FakeHandle:
         def rpc(self, topic, payload):
             graph = {"graph": {"nodes": [
-                {"metadata": {"type": "qvendor_ibm"}},
-                {"metadata": {"type": "qvendor_braket"}},
+                {"metadata": {"type": "qdevice_ibm"}},
+                {"metadata": {"type": "qdevice_braket"}},
                 {"metadata": {"type": "core"}},
             ]}}
             return FakeRPC({"R": graph})

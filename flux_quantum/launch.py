@@ -5,7 +5,7 @@
 # The scout requests a small classical foothold AND the selected vendor's
 # quantum device from the resource graph, in ONE slot:
 #
-#     slot -> [ core , qvendor_<vendor> -> qpu ]
+#     slot -> [ core , qdevice_<vendor> -> qpu ]
 #
 # so fluxion co-allocates a core and a qpu for it. THIS is the coschedule match
 # against the quantum vertices modeled in the graph (see `flux inject` / the
@@ -13,24 +13,29 @@
 # backend may be mocked) and unholds the paired, larger classical job.
 #
 # The mock replaces only the vendor API/session -- the graph match is real: if
-# qvendor_<vendor> -> qpu is not in the graph, the scout is unsatisfiable and
+# qdevice_<vendor> -> qpu is not in the graph, the scout is unsatisfiable and
 # never runs, exactly as intended.
 ##############################################################
 import argparse
 import json
 import os
 
+from . import qresource
+
 
 def build_scout_jobspec(vendor, rendezvous, hold_job, ncores=1, duration=0,
-                        scout_path=None, session=None):
+                        scout_path=None, session=None, live_graph=None,
+                        options=None):
     """Return a v1 jobspec dict for the scout.
 
-    Requests a classical core AND the vendor's quantum device as TWO top-level
-    resources -- a node-level slot (node->slot->core) AND a separate root-level
-    qvendor_<vendor> -> qpu. A qpu is a root-level device (a sibling of node,
-    like an ssd), so it lives in a different graph subtree than the node's cores;
-    fluxion cannot place ONE slot spanning both subtrees (that is infeasible and
-    returns EBUSY). Two top-level resources is the proven issue1284 pattern.
+    Requests a classical foothold AND the vendor's quantum device as TWO
+    top-level resources: a node-level slot (node->slot->core) AND a separate
+    qdevice_<vendor> -> qpu (from qresource.jobspec_resource, exclusive). The
+    qdevice is a rack-level device (a sibling of rack, like an ssd) in a
+    different subtree than the node's cores; fluxion cannot place ONE slot
+    spanning both subtrees, so two top-level resources -- the proven issue1284
+    pattern -- is used. NOTE: the classical descent (node->slot->core) matches a
+    socketless graph; a socketed (hwloc) deployment needs node->socket->...->core.
     """
     if scout_path is None:
         scout_path = os.path.join(
@@ -41,26 +46,34 @@ def build_scout_jobspec(vendor, rendezvous, hold_job, ncores=1, duration=0,
                "--vendor", vendor]
     if session:
         command += ["--session", session]
+    # vendor-specific options (from the backend's scout_options) travel to the
+    # scout as JSON; the backend's open_session consumes them.
+    if options:
+        import json as _json
+        command += ["--options", _json.dumps(options)]
+    # classical foothold: derived from the live graph so the node->...->core
+    # path matches the real hierarchy (socket or not). Falls back to
+    # node->slot->core when no graph is available (e.g. unit tests).
+    if live_graph is not None:
+        classical = qresource.classical_resource(live_graph, ncores=ncores,
+                                                 label="scout")
+    else:
+        classical = {
+            "type": "node",
+            "count": 1,
+            "with": [{
+                "type": "slot", "count": 1, "label": "scout",
+                "with": [{"type": "core", "count": ncores}],
+            }],
+        }
     return {
         "version": 1,
         "resources": [
-            {
-                "type": "node",
-                "count": 1,
-                "with": [
-                    {
-                        "type": "slot",
-                        "count": 1,
-                        "label": "scout",
-                        "with": [{"type": "core", "count": ncores}],
-                    }
-                ],
-            },
-            {
-                "type": "qvendor_{}".format(vendor),
-                "count": 1,
-                "with": [{"type": "qpu", "count": 1}],
-            },
+            classical,
+            # quantum device: qdevice_<vendor> -> qpu, exclusive so it lands in
+            # R (see qresource.jobspec_resource). ONE shape source, shared with
+            # the graph populator.
+            qresource.jobspec_resource(vendor),
         ],
         "attributes": {"system": {"duration": duration}},
         "tasks": [
@@ -81,13 +94,13 @@ def submit_scout(handle, vendor, rendezvous, hold_job, ncores=1, duration=0,
 def main():
     ap = argparse.ArgumentParser(
         prog="quantum-scout-launch",
-        description="submit the scout job (requests core + qvendor_<v> -> qpu)")
+        description="submit the scout job (requests core + qdevice_<v> -> qpu)")
     ap.add_argument("--job", required=True,
                     help="classical (main) job id the scout will unhold")
     ap.add_argument("--rendezvous", required=True,
                     help="shared, user-owned rendezvous directory")
     ap.add_argument("--vendor", required=True,
-                    help="quantum vendor; its qvendor_<vendor> -> qpu is matched")
+                    help="quantum vendor; its qdevice_<vendor> -> qpu is matched")
     ap.add_argument("--cores", type=int, default=1,
                     help="classical foothold cores for the scout (default 1)")
     ap.add_argument("--duration", type=int, default=0,

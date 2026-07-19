@@ -6,7 +6,8 @@ and production never exposes a mock vendor.
 """
 import os
 
-from .base import Backend, Signals, register, get_backend, known_vendors  # noqa: F401
+from .base import (Backend, Signals, register, get_backend,  # noqa: F401
+                   known_vendors, backend_classes)
 from . import ibm    # noqa: F401  (registers IBMBackend)
 from . import braket  # noqa: F401  (registers BraketBackend)
 

@@ -28,10 +28,41 @@ class Signals:
 
 
 class Backend(ABC):
-    """One vendor's live-signal provider. Runs in userspace with user creds."""
+    """One vendor's live-signal provider AND scout session opener. Runs in
+    userspace with the user's credentials (in the CLI plugin for probing, and in
+    the scout job for opening the session)."""
 
-    #: short vendor key, e.g. "ibm"; must match the qvendor_<name> registry type
+    #: short vendor key, e.g. "ibm"; must match the qdevice_<name> registry type
     name = None
+
+    @classmethod
+    def add_options(cls, add_option):
+        """Declare vendor-specific CLI options for `flux submit`.
+
+        `add_option(name, **kwargs)` is the plugin's registrar; names get the
+        "quantum" prefix (so "--ibm-backend" becomes "--quantum-ibm-backend").
+        Namespace options by vendor to avoid collisions across backends. These
+        options let the user shape THIS vendor's scout. Default: no options.
+        """
+        return
+
+    def scout_options(self, args):
+        """Return a JSON-serializable dict of this vendor's options, read from
+        the parsed CLI args, to hand to the scout (which passes them to
+        open_session). Default: empty. Only the SELECTED vendor's options are
+        collected, so reading another vendor's args here is harmless.
+        """
+        return {}
+
+    def open_session(self, options):
+        """Open a vendor session using the user's credentials and `options` (the
+        dict from scout_options), and return the session id string.
+
+        Runs in the SCOUT job (userspace). This is the vendor-specific scout
+        logic. Override per vendor; the default makes the omission explicit.
+        """
+        raise NotImplementedError(
+            "{}: open_session is not implemented for this vendor".format(self.name))
 
     @abstractmethod
     def credentials_present(self):
@@ -71,3 +102,8 @@ def get_backend(name):
 def known_vendors():
     """Return the set of vendor names that have a registered backend."""
     return set(_REGISTRY)
+
+
+def backend_classes():
+    """Return the registered Backend subclasses (for CLI option declaration)."""
+    return list(_REGISTRY.values())

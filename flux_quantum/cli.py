@@ -12,7 +12,7 @@ CLI options (namespaced by the "quantum" prefix):
 
 Discovery order for candidates:
     1. --quantum-vendor if given (single candidate)
-    2. otherwise the vendors discovered in the fluxion qvendor_* registry
+    2. otherwise the vendors discovered in the fluxion qdevice_* registry
        (via the resource.find RPC), falling back to the vendors that have a
        registered backend if the registry is empty or unreachable
 
@@ -33,33 +33,120 @@ from .launch import build_scout_jobspec
 _ACTIVE_PROGS = ("submit", "run", "batch", "bulksubmit", "alloc")
 
 
-def split_and_submit(handle, jobspec, vendor, rendezvous,
-                     scout_cores=1, submit_fn=None):
-    """THE submission path: take the user's jobspec, split it into a held
-    classical MAIN and a classical+quantum SCOUT, and submit BOTH.
-
-    Returns (main_id, scout_id). The user's jobspec is the classical work: we
-    stamp + hold it as the MAIN, then assemble the SCOUT (a small core AND the
-    vendor's device, qvendor_<vendor> -> qpu, via build_scout_jobspec) that opens
-    the session and unholds the MAIN.
-
-    Order is fixed, not a design choice: the MAIN is submitted first because the
-    SCOUT must reference the MAIN's id -- it fires the unhold RPC on it and keys
-    the rendezvous file to it.
+def _default_rendezvous():
+    """Default shared rendezvous dir. MUST be on a filesystem visible to both
+    the scout and the (released) classical -- they may land on different nodes.
+    Override with --quantum-rendezvous or $FLUX_QUANTUM_RENDEZVOUS.
     """
+    return os.environ.get(
+        "FLUX_QUANTUM_RENDEZVOUS",
+        os.path.join(os.path.expanduser("~"), ".flux-quantum", "rendezvous"),
+    )
+
+
+def _wrap_commands(jobspec_dict, wrap_path, rendezvous):
+    """Wrap every task command so the classical job blocks for the session id
+    (deposited by the scout) and exports it as QUANTUM_SESSION_ID before exec."""
+    for task in jobspec_dict.get("tasks", []):
+        cmd = list(task.get("command", []))
+        task["command"] = (
+            ["flux", "python", wrap_path, "--rendezvous", rendezvous, "--"] + cmd
+        )
+
+
+def _safe_cancel(cancel_fn, handle, jobid, reason):
+    """Best-effort cancel of the held classical so a failed setup never leaves a
+    job parked forever. Never raises."""
+    try:
+        cancel_fn(handle, jobid, reason)
+    except Exception as exc:  # pragma: no cover - best effort
+        print("flux quantum: WARNING failed to cancel job {}: {}".format(jobid, exc),
+              file=sys.stderr)
+
+
+def prepare_pair(handle, jobspec, vendor, rendezvous, scout_cores=1,
+                 options=None, submit_fn=None, populate_fn=None,
+                 get_graph_fn=None, cancel_fn=None, wrap_path=None,
+                 scout_path=None):
+    """The production quantum-submit core: submit the user's work as a HELD
+    classical job, gate on it entering the queue, then rewrite ``jobspec`` IN
+    PLACE into the scout that will release the classical. Returns the classical
+    (main) jobid.
+
+    ``flux submit`` submits whatever this leaves in ``jobspec`` -- so it ends up
+    submitting the scout, while the held classical (the user's real work) is
+    submitted here and released later by the scout.
+
+    All flux operations are injectable so this is unit-testable without a broker;
+    ``modify_jobspec`` supplies the real ones.
+    """
+    import copy
     import json
     if submit_fn is None:
         from flux.job import submit as submit_fn
-    # MAIN: the user's classical work, held + reserved-first.
-    jobspec.setattr("system.quantum.vendor", vendor)
-    if rendezvous:
-        jobspec.setattr("system.quantum.rendezvous", rendezvous)
-    jobspec.setattr("system.hold", 1)
-    main_id = submit_fn(handle, jobspec)
-    # SCOUT: classical foothold + the vendor's qpu; unholds the MAIN when live.
-    scout = build_scout_jobspec(vendor, rendezvous or "", main_id, ncores=scout_cores)
-    scout_id = submit_fn(handle, json.dumps(scout))
-    return main_id, scout_id
+    if cancel_fn is None:
+        from flux.job import cancel as cancel_fn
+    if populate_fn is None or get_graph_fn is None:
+        from . import graph as _graph
+        populate_fn = populate_fn or _graph.populate
+        get_graph_fn = get_graph_fn or _graph.get_live_graph
+    if wrap_path is None:
+        wrap_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wrap.py")
+
+    # 1. CLASSICAL = the user's work, wrapped to wait for the session, born held.
+    classical = copy.deepcopy(jobspec.jobspec)
+    _wrap_commands(classical, wrap_path, rendezvous)
+    sysattr = classical.setdefault("attributes", {}).setdefault("system", {})
+    sysattr["hold"] = 1
+    quantum = sysattr.setdefault("quantum", {})
+    quantum["vendor"] = vendor
+    quantum["rendezvous"] = rendezvous
+
+    # 2. Submit held and GATE. If the cluster runs feasibility validation, an
+    #    unsatisfiable request is rejected at ingest and submit raises -- abort
+    #    the whole `flux submit` (no scout, no quantum quota). If feasibility is
+    #    off, the job is guaranteed to enter the queue and we proceed.
+    try:
+        main_id = int(submit_fn(handle, json.dumps(classical)))
+    except SystemExit:
+        raise
+    except Exception as exc:
+        raise SystemExit(
+            "flux quantum: classical request not accepted "
+            "(unsatisfiable, or ingest error): {}".format(exc))
+
+    # 3. Ensure the vendor device is in the graph and derive the scout's
+    #    classical foothold from the LIVE graph (so node->...->core matches the
+    #    real hierarchy). On any failure, cancel the held classical.
+    try:
+        populate_fn(handle, [vendor])
+        live = get_graph_fn(handle)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        _safe_cancel(cancel_fn, handle, main_id,
+                     "flux quantum: aborting held classical (graph setup failed)")
+        raise SystemExit("flux quantum: could not prepare the quantum graph: {}".format(exc))
+
+    # 4. Rewrite THIS jobspec into the scout (foothold + exclusive qpu, running
+    #    scout.py which opens the session and releases main_id).
+    try:
+        scout = build_scout_jobspec(vendor, rendezvous, main_id,
+                                    ncores=scout_cores, live_graph=live,
+                                    scout_path=scout_path, options=options)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        _safe_cancel(cancel_fn, handle, main_id,
+                     "flux quantum: aborting held classical (scout build failed)")
+        raise SystemExit("flux quantum: could not build the scout jobspec: {}".format(exc))
+
+    jobspec.jobspec["resources"] = scout["resources"]
+    jobspec.jobspec["tasks"] = scout["tasks"]
+    out = jobspec.jobspec.setdefault("attributes", {}).setdefault("system", {})
+    out.pop("hold", None)  # the scout must NOT be held; it runs immediately
+    out["duration"] = scout["attributes"]["system"]["duration"]
+    return main_id
 
 
 class QuantumCLIPlugin(CLIPlugin):
@@ -75,6 +162,15 @@ class QuantumCLIPlugin(CLIPlugin):
                         help="auto-select vendor: any | queue | cost")
         self.add_option("--rendezvous", metavar="DIR", default=None,
                         help="shared rendezvous dir for the session handoff")
+        # let each registered vendor backend contribute its own options
+        # (namespaced, e.g. --quantum-ibm-backend, --quantum-mock-session), so a
+        # quantum submit can carry vendor-specific parameters for the scout.
+        try:
+            from .backends import backend_classes
+            for backend_cls in backend_classes():
+                backend_cls.add_options(self.add_option)
+        except Exception:  # pragma: no cover - defensive
+            pass
         # cache the choice from preinit for modify_jobspec/validate
         self._chosen = None
         self._rendezvous = None
@@ -83,17 +179,30 @@ class QuantumCLIPlugin(CLIPlugin):
         # activated when the user asks for a vendor or an auto-select policy
         return bool(getattr(args, "vendor", None) or getattr(args, "select", None))
 
-    def preinit(self, args):
-        """Probe backends with the user's creds and pick a vendor."""
+    def _resolve_vendor(self, args, quiet=False):
+        """Resolve the vendor for this submit from ARGS (explicit
+        --quantum-vendor, or --quantum-select policy), caching it on the
+        instance. Returns the vendor name, or None if this is not a quantum
+        submit.
+
+        Called from BOTH preinit and modify_jobspec because flux runs those
+        hooks on DIFFERENT plugin instances (jobspec.apply_options builds its
+        own CLIPluginRegistry), so any vendor cached by preinit is NOT visible
+        in modify_jobspec -- each instance must resolve from args. Diagnostics
+        go to stderr (stdout carries the jobid that `cid=$(flux submit ...)`
+        captures); pass quiet=True to suppress them on the second resolution.
+        """
         if not self._is_quantum(args):
-            return
+            return None
+        if self._chosen is not None:
+            return self._chosen
         policy = args.select or "any"
         disc_line = None
         if args.vendor:
             candidates = [args.vendor]
         else:
             # --quantum-select with no explicit vendor: discover candidates from
-            # the fluxion qvendor_* registry; fall back to registered backends.
+            # the fluxion qdevice_* registry; fall back to registered backends.
             candidates = self._discover_candidates()
             if candidates is not None:
                 disc_line = "discovered from registry: " + " ".join(candidates)
@@ -103,16 +212,20 @@ class QuantumCLIPlugin(CLIPlugin):
             raise SystemExit("flux quantum: {}".format(e))
         self._chosen = vendor
         self._rendezvous = args.rendezvous
-        # IMPORTANT: diagnostics MUST go to stderr. flux submit prints the
-        # jobid to stdout, and cid=$(flux submit ...) captures stdout -- any
-        # plugin output on stdout corrupts the captured jobid.
-        if disc_line:
-            print("flux quantum: " + disc_line, file=sys.stderr)
-        for line in log:
-            print("flux quantum: " + line, file=sys.stderr)
+        if not quiet:
+            if disc_line:
+                print("flux quantum: " + disc_line, file=sys.stderr)
+            for line in log:
+                print("flux quantum: " + line, file=sys.stderr)
+        return vendor
+
+    def preinit(self, args):
+        """Probe backends with the user's creds and pick a vendor (diagnostics
+        only; modify_jobspec re-resolves and does the authoritative stamping)."""
+        self._resolve_vendor(args)
 
     def _discover_candidates(self):
-        """Discover vendor candidates from the live fluxion qvendor_* registry.
+        """Discover vendor candidates from the live fluxion qdevice_* registry.
 
         Opens a flux handle and reads the registry via the selector helper.
         Returns a sorted list of vendor names, or None to signal "fall back to
@@ -129,14 +242,31 @@ class QuantumCLIPlugin(CLIPlugin):
         return None
 
     def modify_jobspec(self, args, jobspec):
-        """Stamp the choice + hold the job (no .resources rewrite needed)."""
-        if not self._chosen:
-            return
-        jobspec.setattr("system.quantum.vendor", self._chosen)
-        if self._rendezvous:
-            jobspec.setattr("system.quantum.rendezvous", self._rendezvous)
-        # hold + reserve-first via our fluxion mechanism
-        jobspec.setattr("system.hold", 1)
+        """THE quantum submit path. When --quantum-* is present this submits the
+        user's work as a HELD classical job, gates on it entering the queue, and
+        rewrites `jobspec` into the scout that releases it -- so one `flux
+        submit` produces the classical+scout pair.
+
+        Resolves the vendor from ARGS (not preinit's cache): flux runs preinit
+        and modify_jobspec on different plugin instances, so self._chosen may be
+        None here even though preinit ran.
+        """
+        vendor = self._resolve_vendor(args, quiet=True)
+        if not vendor:
+            return  # not a quantum submit; leave the jobspec untouched
+
+        from .backends import get_backend
+        backend = get_backend(vendor)
+        options = backend.scout_options(args) if backend else {}
+
+        import flux
+        handle = flux.Flux()
+        rendezvous = (self._rendezvous or getattr(args, "rendezvous", None)
+                      or _default_rendezvous())
+        main_id = prepare_pair(handle, jobspec, vendor, rendezvous,
+                               scout_cores=1, options=options)
+        print("flux quantum: held classical job {} (vendor={}); this submit "
+              "launches its scout".format(main_id, vendor), file=sys.stderr)
 
     def validate(self, jobspec):
         """Fail before submission if the chosen vendor's creds are missing.

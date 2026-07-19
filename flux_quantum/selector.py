@@ -5,11 +5,13 @@ the user or discovered from the fluxion registry), probe each candidate's
 backend for live signals and pick one by a simple policy. Runs in userspace
 (the CLI plugin) because probing needs the user's credentials.
 
-Discovery of the fluxion "qvendor_*" registry (via the resource.find RPC) is
+Discovery of the fluxion "qdevice_*" registry (via the resource.find RPC) is
 optional and only used when the user does not name candidates explicitly; it is
 kept behind discover_registry_vendors() so the selector works with or without a
 live fluxion handle.
 """
+
+from . import qresource
 from .backends import get_backend, known_vendors
 
 
@@ -79,10 +81,10 @@ def select_vendor(candidates=None, policy=None):
 
 
 def discover_registry_vendors(handle):
-    """Discover qvendor_* types from the live fluxion graph via resource.find.
+    """Discover qdevice_* types from the live fluxion graph via resource.find.
 
     Optional helper: returns the set of vendor names present in the registry
-    (the part after 'qvendor_'). Requires a flux handle. Returns empty set on
+    (the part after 'qdevice_'). Requires a flux handle. Returns empty set on
     any error so callers can fall back to backend/user-named candidates.
     """
     try:
@@ -94,8 +96,8 @@ def discover_registry_vendors(handle):
         vendors = set()
         for node in graph.get("graph", {}).get("nodes", []):
             t = node.get("metadata", {}).get("type", "")
-            if t.startswith("qvendor_"):
-                vendors.add(t[len("qvendor_"):])
+            if t.startswith(qresource.QDEVICE_PREFIX):
+                vendors.add(t[len(qresource.QDEVICE_PREFIX):])
         return vendors
     except Exception:
         return set()
