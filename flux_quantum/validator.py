@@ -10,13 +10,18 @@ Wire-up (flux-config-ingest): add this module to [ingest.validator] plugins.
 It follows the flux job-validator plugin convention: a validate(args) callable
 that raises ValueError (or returns an error) on an invalid jobspec.
 """
+
 from .backends import known_vendors
 
 
 def _vendor_of(jobspec):
     try:
-        return (jobspec.get("attributes", {}).get("system", {})
-                .get("quantum", {}).get("vendor"))
+        return (
+            jobspec.get("attributes", {})
+            .get("system", {})
+            .get("quantum", {})
+            .get("vendor")
+        )
     except AttributeError:
         return None
 

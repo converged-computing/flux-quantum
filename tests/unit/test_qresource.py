@@ -1,4 +1,5 @@
 """Unit tests for the single quantum-resource shape source."""
+
 from flux_quantum import qresource as qr
 
 
@@ -25,13 +26,26 @@ def test_jobspec_resource_nqpus():
 def _live(root_path="/cluster0"):
     return {
         "nodes": [
-            {"id": "0", "metadata": {"type": "cluster", "rank": -1,
-                                     "paths": {"containment": root_path}}},
-            {"id": "1", "metadata": {"type": "rack", "rank": -1,
-                                     "paths": {"containment": root_path + "/rack0"}}},
+            {
+                "id": "0",
+                "metadata": {
+                    "type": "cluster",
+                    "rank": -1,
+                    "paths": {"containment": root_path},
+                },
+            },
+            {
+                "id": "1",
+                "metadata": {
+                    "type": "rack",
+                    "rank": -1,
+                    "paths": {"containment": root_path + "/rack0"},
+                },
+            },
         ],
-        "edges": [{"source": "0", "target": "1",
-                   "metadata": {"subsystem": "containment"}}],
+        "edges": [
+            {"source": "0", "target": "1", "metadata": {"subsystem": "containment"}}
+        ],
     }
 
 
@@ -41,7 +55,9 @@ def test_graph_subgraph_attaches_qdevice_at_root():
     types = [n["metadata"]["type"] for n in g["nodes"]]
     assert "qdevice_ibm" in types and types.count("qpu") == 1
     # the root is copied verbatim so fluxion matches (path, rank) and attaches
-    assert any(n["id"] == "0" and n["metadata"]["type"] == "cluster" for n in g["nodes"])
+    assert any(
+        n["id"] == "0" and n["metadata"]["type"] == "cluster" for n in g["nodes"]
+    )
     # qdevice is a child of the root (id 0) -> a sibling of rack
     qd = next(n for n in g["nodes"] if n["metadata"]["type"] == "qdevice_ibm")
     assert any(e["source"] == "0" and e["target"] == qd["id"] for e in g["edges"])
@@ -67,10 +83,22 @@ def _live_with_sockets():
     # cluster -> node -> socket -> core (hwloc-style)
     return {
         "nodes": [
-            {"id": "0", "metadata": {"type": "cluster", "paths": {"containment": "/c0"}}},
-            {"id": "1", "metadata": {"type": "node", "paths": {"containment": "/c0/n0"}}},
-            {"id": "2", "metadata": {"type": "socket", "paths": {"containment": "/c0/n0/s0"}}},
-            {"id": "3", "metadata": {"type": "core", "paths": {"containment": "/c0/n0/s0/c0"}}},
+            {
+                "id": "0",
+                "metadata": {"type": "cluster", "paths": {"containment": "/c0"}},
+            },
+            {
+                "id": "1",
+                "metadata": {"type": "node", "paths": {"containment": "/c0/n0"}},
+            },
+            {
+                "id": "2",
+                "metadata": {"type": "socket", "paths": {"containment": "/c0/n0/s0"}},
+            },
+            {
+                "id": "3",
+                "metadata": {"type": "core", "paths": {"containment": "/c0/n0/s0/c0"}},
+            },
         ],
         "edges": [
             {"source": "0", "target": "1", "metadata": {"subsystem": "containment"}},
@@ -84,10 +112,22 @@ def _live_no_sockets():
     # cluster -> rack -> node -> core (issue1284-style)
     return {
         "nodes": [
-            {"id": "0", "metadata": {"type": "cluster", "paths": {"containment": "/c0"}}},
-            {"id": "1", "metadata": {"type": "rack", "paths": {"containment": "/c0/r0"}}},
-            {"id": "2", "metadata": {"type": "node", "paths": {"containment": "/c0/r0/n0"}}},
-            {"id": "3", "metadata": {"type": "core", "paths": {"containment": "/c0/r0/n0/c0"}}},
+            {
+                "id": "0",
+                "metadata": {"type": "cluster", "paths": {"containment": "/c0"}},
+            },
+            {
+                "id": "1",
+                "metadata": {"type": "rack", "paths": {"containment": "/c0/r0"}},
+            },
+            {
+                "id": "2",
+                "metadata": {"type": "node", "paths": {"containment": "/c0/r0/n0"}},
+            },
+            {
+                "id": "3",
+                "metadata": {"type": "core", "paths": {"containment": "/c0/r0/n0/c0"}},
+            },
         ],
         "edges": [
             {"source": "0", "target": "1", "metadata": {"subsystem": "containment"}},
@@ -117,6 +157,11 @@ def test_classical_resource_mirrors_hierarchy():
 
 def test_classical_resource_fallback_no_core():
     # a graph with no core -> falls back to node -> slot -> core
-    empty = {"nodes": [{"id": "0", "metadata": {"type": "cluster", "paths": {"containment": "/c"}}}], "edges": []}
+    empty = {
+        "nodes": [
+            {"id": "0", "metadata": {"type": "cluster", "paths": {"containment": "/c"}}}
+        ],
+        "edges": [],
+    }
     r = qr.classical_resource(empty)
     assert r["type"] == "node" and r["with"][0]["type"] == "slot"

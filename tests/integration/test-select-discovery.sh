@@ -18,7 +18,6 @@ HERE=$(cd "$(dirname "$0")/../.." && pwd)
 SELF=$(cd "$(dirname "$0")" && pwd)
 export FLUX_QUANTUM_MOCK=1
 export FLUX_CLI_PLUGINPATH="$HERE/cli-plugins"
-RDV=/tmp/qrdv.$$; rm -rf "$RDV"; mkdir -p "$RDV"
 ERR=/tmp/qsel.err.$$
 
 echo "=== 1. plant the vendor registry (mock ibm braket) via add-subgraph ==="
@@ -26,8 +25,8 @@ VENDORS="mock ibm braket" bash "$SELF/setup-mock-registry.sh" || exit 1
 
 echo ""
 echo "=== 2. submit with --quantum-select any (NO explicit vendor) ==="
-cid=$(flux submit --quantum-select any --quantum-rendezvous "$RDV" -n1 \
-        flux python "$HERE/flux_quantum/wrap.py" --rendezvous "$RDV" \
+cid=$(flux submit --quantum-select any -n1 \
+        flux python "$HERE/flux_quantum/wrap.py" \
         -- sh -c 'echo QUANTUM_SESSION=$QUANTUM_SESSION_ID' 2>"$ERR")
 echo "submitted: $cid"
 echo "--- plugin stderr ---"; sed 's/^/    /' "$ERR"
@@ -56,7 +55,7 @@ echo "state (expect SCHED, i.e. held): $st"
 # can run, open the (mock) session, and unhold the main. A bare `flux run -n1`
 # would not exercise the quantum match at all.
 scout_id=$(flux python "$HERE/flux_quantum/launch.py" \
-        --job "$cid" --rendezvous "$RDV" --vendor mock --session AUTOSESS456)
+        --job "$cid" --vendor mock --session AUTOSESS456)
 echo "scout submitted (requests core + qdevice_mock->qpu): $scout_id"
 if ! flux job wait-event -t 20 "$scout_id" clean </dev/null; then
     echo "FAIL: scout never ran -- the core+qpu coschedule match failed"
@@ -82,5 +81,5 @@ fi
 flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
 flux module remove -f sched-fluxion-resource 2>/dev/null || true
 
-rm -rf "$RDV" "$ERR"
+rm -f "$ERR"
 exit "${rc:-0}"

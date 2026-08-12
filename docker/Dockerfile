@@ -195,7 +195,7 @@ RUN git clone --depth 1 --branch ${FLUX_SCHED_BRANCH} ${FLUX_SCHED_REPO} flux-sc
     cmake -B build --preset default -DCMAKE_INSTALL_PREFIX=/usr && \
     cmake --build build -j$(nproc) && \
     cmake --build build -t install && \
-    ldconfig 
+    ldconfig
 
 RUN apt-get update && \
     apt-get install -y pdsh libfabric-dev libfabric1 \

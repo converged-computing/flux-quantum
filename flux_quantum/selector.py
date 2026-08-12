@@ -23,9 +23,9 @@ def _rank_key(policy):
     """Return a sort key(fn) over (vendor, Signals) for the given policy."""
     if policy in (None, "any", "available"):
         return lambda item: 0
-    if policy == "queue":       # shortest queue first
+    if policy == "queue":  # shortest queue first
         return lambda item: (item[1].queue_depth is None, item[1].queue_depth or 0)
-    if policy == "cost":        # cheapest first
+    if policy == "cost":  # cheapest first
         return lambda item: (item[1].cost is None, item[1].cost or 0)
     raise SelectionError("unknown select policy: {}".format(policy))
 
@@ -71,8 +71,7 @@ def select_vendor(candidates=None, policy=None):
         log.append("{}: candidate ({})".format(name, sig))
 
     if not usable:
-        raise SelectionError(
-            "no usable quantum vendor.\n  " + "\n  ".join(log))
+        raise SelectionError("no usable quantum vendor.\n  " + "\n  ".join(log))
 
     usable.sort(key=_rank_key(policy))
     name, sig = usable[0]
@@ -89,15 +88,17 @@ def discover_registry_vendors(handle):
     """
     try:
         import json
-        resp = handle.rpc("sched-fluxion-resource.find",
-                          {"criteria": "status=up", "format": "jgf"}).get()
+
+        resp = handle.rpc(
+            "sched-fluxion-resource.find", {"criteria": "status=up", "format": "jgf"}
+        ).get()
         R = resp.get("R")
         graph = R if isinstance(R, dict) else json.loads(R)
         vendors = set()
         for node in graph.get("graph", {}).get("nodes", []):
             t = node.get("metadata", {}).get("type", "")
             if t.startswith(qresource.QDEVICE_PREFIX):
-                vendors.add(t[len(qresource.QDEVICE_PREFIX):])
+                vendors.add(t[len(qresource.QDEVICE_PREFIX) :])
         return vendors
     except Exception:
         return set()

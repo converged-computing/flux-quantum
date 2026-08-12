@@ -7,4 +7,5 @@ installed flux_quantum package (absolute import), so the plugin's real code
 lives in the package and flux never tries to import package internals as
 standalone plugin files.
 """
+
 from flux_quantum.cli import QuantumCLIPlugin  # noqa: F401

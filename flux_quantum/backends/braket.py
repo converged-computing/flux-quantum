@@ -4,6 +4,7 @@ MOCK probe for now: real impl uses boto3/Braket with the user's AWS creds to
 read device availability / queue / price. Different execution model from QRMI,
 which is exactly why it is its own backend.
 """
+
 import os
 from .base import Backend, Signals, register
 
@@ -15,12 +16,24 @@ class BraketBackend(Backend):
 
     @classmethod
     def add_options(cls, add_option):
-        add_option("--braket-device", metavar="ARN", default=None,
-                   help="Braket: device ARN to target")
-        add_option("--braket-region", metavar="REGION", default=None,
-                   help="Braket: AWS region for the device")
-        add_option("--braket-shots", metavar="N", default=None,
-                   help="Braket: number of shots for the session workload")
+        add_option(
+            "--braket-device",
+            metavar="ARN",
+            default=None,
+            help="Braket: device ARN to target",
+        )
+        add_option(
+            "--braket-region",
+            metavar="REGION",
+            default=None,
+            help="Braket: AWS region for the device",
+        )
+        add_option(
+            "--braket-shots",
+            metavar="N",
+            default=None,
+            help="Braket: number of shots for the session workload",
+        )
 
     def scout_options(self, args):
         return {
@@ -34,7 +47,8 @@ class BraketBackend(Backend):
         # the Braket device session (options["device"]/region) and return its id.
         raise NotImplementedError(
             "Braket open_session not yet implemented; use --quantum-vendor mock "
-            "with FLUX_QUANTUM_MOCK for now (options captured: {})".format(options))
+            "with FLUX_QUANTUM_MOCK for now (options captured: {})".format(options)
+        )
 
     def credentials_present(self):
         missing = [v for v in self.required_env if not os.environ.get(v)]
@@ -44,5 +58,6 @@ class BraketBackend(Backend):
 
     def probe(self):
         # REAL IMPL: braket device status / queue / pricing via the user's creds.
-        return Signals(available=True, queue_depth=None, cost=None,
-                       detail={"note": "mock probe"})
+        return Signals(
+            available=True, queue_depth=None, cost=None, detail={"note": "mock probe"}
+        )

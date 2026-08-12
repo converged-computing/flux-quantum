@@ -35,6 +35,7 @@ def test_backend_declares_options_and_scout_options_roundtrip():
     """A vendor backend declares CLI options and extracts them from args."""
     from flux_quantum.backends import get_backend
     import flux_quantum.backends.ibm  # ensure ibm registered
+
     ibm = get_backend("ibm")
     declared = []
     ibm.add_options(lambda name, **kw: declared.append(name))
@@ -44,6 +45,7 @@ def test_backend_declares_options_and_scout_options_roundtrip():
         ibm_backend = "ibm_brisbane"
         ibm_instance = None
         ibm_shots = "1024"
+
     opts = ibm.scout_options(_Args())
     assert opts["backend"] == "ibm_brisbane" and opts["shots"] == "1024"
 
@@ -52,6 +54,7 @@ def test_mock_open_session_uses_options(monkeypatch):
     monkeypatch.setenv("FLUX_QUANTUM_MOCK", "1")
     import importlib
     from flux_quantum.backends import mock as mockmod
+
     importlib.reload(mockmod)
     b = mockmod.MockBackend()
     # forced session id honored
@@ -63,5 +66,6 @@ def test_mock_open_session_uses_options(monkeypatch):
 def test_ibm_open_session_deferred_is_explicit():
     from flux_quantum.backends import get_backend
     import flux_quantum.backends.ibm  # noqa
+
     with __import__("pytest").raises(NotImplementedError):
         get_backend("ibm").open_session({"backend": "x"})

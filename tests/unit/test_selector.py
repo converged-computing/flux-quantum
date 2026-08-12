@@ -35,9 +35,10 @@ def test_mock_selection_token_free(backends_mock):
 
 def test_ranking_by_queue(backends_mock):
     sel = _selector()
-    vendor, sig, log = sel.select_vendor(candidates=["mock_busy", "mock"],
-                                         policy="queue")
-    assert vendor == "mock"   # queue_depth 0 beats 9
+    vendor, sig, log = sel.select_vendor(
+        candidates=["mock_busy", "mock"], policy="queue"
+    )
+    assert vendor == "mock"  # queue_depth 0 beats 9
 
 
 def test_discover_registry_vendors_parses_jgf(backends_real):
@@ -46,16 +47,21 @@ def test_discover_registry_vendors_parses_jgf(backends_real):
     class FakeRPC:
         def __init__(self, payload):
             self._p = payload
+
         def get(self):
             return self._p
 
     class FakeHandle:
         def rpc(self, topic, payload):
-            graph = {"graph": {"nodes": [
-                {"metadata": {"type": "qdevice_ibm"}},
-                {"metadata": {"type": "qdevice_braket"}},
-                {"metadata": {"type": "core"}},
-            ]}}
+            graph = {
+                "graph": {
+                    "nodes": [
+                        {"metadata": {"type": "qdevice_ibm"}},
+                        {"metadata": {"type": "qdevice_braket"}},
+                        {"metadata": {"type": "core"}},
+                    ]
+                }
+            }
             return FakeRPC({"R": graph})
 
     vendors = sel.discover_registry_vendors(FakeHandle())

@@ -6,7 +6,7 @@
 # plugin's modify_jobspec: it submits the user's work as a HELD classical job
 # (wrapped to wait for the session), gates on it entering the queue, populates
 # qdevice_mock->qpu into the graph, and rewrites the submit into the SCOUT.
-# The scout opens a mock session, hands it off via the rendezvous dir, and
+# The scout opens a mock session, posts it to the classical job's eventlog, and
 # releases the classical -- which then runs with QUANTUM_SESSION_ID set.
 #
 # stdout of `flux submit` is the SCOUT id; the held classical id is reported by
@@ -21,7 +21,6 @@ set -u
 HERE=$(cd "$(dirname "$0")/../.." && pwd)          # repo root
 export FLUX_QUANTUM_MOCK=1
 export FLUX_CLI_PLUGINPATH="$HERE/cli-plugins"
-RDV=/tmp/qrdv.$$; rm -rf "$RDV"; mkdir -p "$RDV"
 ERR=$(mktemp)
 rc=0
 
@@ -46,7 +45,7 @@ echo "=== 2. ONE quantum submit -> plugin submits held classical AND scout ==="
 # classical should print exactly this value. Proves the vendor-option seam.
 FORCED="mocksess-$$"
 scout_id=$(flux submit --quantum-vendor mock --quantum-mock-session "$FORCED" \
-    --quantum-rendezvous "$RDV" -n1 \
+    -n1 \
     -- sh -c 'echo QUANTUM_SESSION=$QUANTUM_SESSION_ID' 2>"$ERR")
 cat "$ERR" >&2
 main_id=$(grep -oE 'held classical job [0-9]+' "$ERR" | awk '{print $NF}')
@@ -76,6 +75,24 @@ if [ -n "$main_id" ]; then
 fi
 
 echo ""
+echo "=== 3b. the scout HELD the qpu for the classical's lifetime ==="
+# The scout must not exit at release time: it holds the fluxion qpu allocation
+# (and the vendor session) until the classical finishes, then closes the
+# session. Its own output is the deterministic proof that it waited.
+if [ -n "$scout_id" ]; then
+    if flux job wait-event -t 30 "$scout_id" clean </dev/null >/dev/null 2>&1; then
+        sout=$(flux job attach "$scout_id" </dev/null 2>&1)
+        echo "$sout" | sed 's/^/    /'
+        echo "$sout" | grep -q "classical job .* finished" || {
+            echo "FAIL: scout did not wait for the classical (qpu freed early)"; rc=1; }
+        echo "$sout" | grep -q "closed mock session" || {
+            echo "FAIL: scout did not close the vendor session"; rc=1; }
+    else
+        echo "FAIL: scout never completed"; rc=1
+    fi
+fi
+
+echo ""
 echo "=== 4. check the instance log for errors DURING the run (before teardown) ==="
 errs=$(flux dmesg 2>&1 | grep -iE "\.err\[[0-9]+\]|: error:|fatal" || true)
 if [ -n "$errs" ]; then
@@ -86,5 +103,5 @@ echo "=== 5. graceful teardown (remove fluxion so shutdown is clean) ==="
 flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
 flux module remove -f sched-fluxion-resource 2>/dev/null || true
 
-rm -rf "$RDV" "$ERR"
+rm -f "$ERR"
 exit "$rc"

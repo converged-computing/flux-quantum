@@ -30,9 +30,11 @@ def backends_mock(monkeypatch):
 @pytest.fixture
 def fresh(monkeypatch):
     """Return the _fresh callable so a test can choose creds/env itself."""
+
     def _make(mock=False, env=None):
         b = _fresh(mock, monkeypatch)
         for k, v in (env or {}).items():
             monkeypatch.setenv(k, v)
         return b
+
     return _make
