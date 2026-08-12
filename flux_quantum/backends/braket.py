@@ -1,8 +1,7 @@
 """AWS Braket backend.
 
-MOCK probe for now: real impl uses boto3/Braket with the user's AWS creds to
-read device availability / queue / price. Different execution model from QRMI,
-which is exactly why it is its own backend.
+The probe is a stub. The real one uses boto3 with the user AWS credentials.
+Braket has no acquire and release like QRMI, so it needs its own backend.
 """
 
 import os
@@ -43,8 +42,7 @@ class BraketBackend(Backend):
         }
 
     def open_session(self, options):
-        # REAL IMPL (vendor-API phase): with the user's AWS creds, open/reserve
-        # the Braket device session (options["device"]/region) and return its id.
+        # TODO validate the reservation ARN for the requested device
         raise NotImplementedError(
             "Braket open_session not yet implemented; use --quantum-vendor mock "
             "with FLUX_QUANTUM_MOCK for now (options captured: {})".format(options)
@@ -57,7 +55,7 @@ class BraketBackend(Backend):
         return True, "Braket: credentials present"
 
     def probe(self):
-        # REAL IMPL: braket device status / queue / pricing via the user's creds.
+        # TODO braket device status, queue and pricing with the user creds
         return Signals(
             available=True, queue_depth=None, cost=None, detail={"note": "mock probe"}
         )

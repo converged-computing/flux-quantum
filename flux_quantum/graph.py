@@ -5,14 +5,12 @@
 # SPDX-License-Identifier: LGPL-3.0
 ##############################################################
 
-"""Live-graph populator.
+"""Splice vendor devices into the live fluxion graph.
 
-Queries the fluxion resource graph and splices in the vendor quantum devices,
-using the owner-gated ``sched-fluxion-resource.find`` / ``add_subgraph`` RPCs via
-the flux Python bindings -- no subprocess, no shelling to ``flux inject``. The
-shape comes from ``qresource``; this module only does the RPCs. Because the RPCs
-are owner-only, a user can populate their OWN subinstance's graph but not the
-system graph.
+Uses the sched-fluxion-resource find / add_subgraph RPCs through the python
+bindings. The shape comes from qresource, so this module only does the RPCs.
+These RPCs are owner-only, so a user can populate their own subinstance but not
+the system graph.
 """
 
 import json
@@ -21,7 +19,7 @@ from . import qresource
 
 
 def get_live_graph(handle, criteria="status=up"):
-    """Return the live fluxion graph {"nodes":..,"edges":..} via the find RPC."""
+    """Return the live fluxion graph of nodes and edges from the find RPC."""
     try:
         resp = handle.rpc(
             "sched-fluxion-resource.find",
@@ -55,11 +53,9 @@ def vendors_present(graph):
 
 
 def populate(handle, vendors, qpus=1, graph=None):
-    """Ensure qdevice_<vendor> -> qpu subtrees exist in the live graph.
+    """Ensure qdevice_<vendor> -> qpu exists in the live graph.
 
-    Idempotent: queries the graph (find), builds a subgraph for the MISSING
-    vendors only (qresource.graph_subgraph), and splices it in via add_subgraph.
-    Returns the set of vendor names actually added.
+    Idempotent, only missing vendors are added. Returns what was added.
     """
     if isinstance(vendors, str):
         vendors = [vendors]

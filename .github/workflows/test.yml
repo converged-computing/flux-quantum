@@ -6,17 +6,34 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Image with flux-core 0.87 + flux-sched@add-hold (provides `flux inject`, the
-# hold RPC, and qmanager). Override with the repo variable QUANTUM_FLUX_IMAGE
-# once an automated build publishes a new tag.
+# flux-core 0.87 plus flux-sched add-hold. Override with the
+# QUANTUM_FLUX_IMAGE repo variable.
 env:
   FLUX_IMAGE: ${{ vars.QUANTUM_FLUX_IMAGE || 'ghcr.io/converged-computing/fluxion-quantum:flux-base-ubuntu-test' }}
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Pure-Python unit tests. No flux required. Token-free logic: backends,
-  # selector/ranking, mock gating, CLI-plugin discovery shim. Always runs.
-  # ---------------------------------------------------------------------------
+  # mirrors pre-commit, so CI fails for the same reason a commit would
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install
+        run: pip install black flake8
+      - name: black
+        run: black --check --diff --target-version py312 flux_quantum tests
+      - name: flake8 (syntax errors only)
+        run: flake8 flux_quantum --select=E9,F63,F7,F82 --show-source
+      - name: shellcheck the integration scripts
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC2016 is off because the tests quote QUANTUM_SESSION_ID on
+          # purpose. It has to expand inside the job and not in the test shell
+          shellcheck -e SC1091,SC2086,SC2016,SC2001 tests/integration/*.sh
+
+  # no flux needed, the flux calls in these paths are injected
   unit:
     runs-on: ubuntu-latest
     strategy:
@@ -32,19 +49,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          pip install pytest flake8
-      - name: lint (syntax only)
-        run: flake8 flux_quantum --select=E9,F63,F7,F82 --show-source
+          pip install pytest
       - name: unit tests
         run: pytest tests/unit -q
 
-  # ---------------------------------------------------------------------------
-  # Integration in the flux image (flux-core 0.87 + flux-sched@add-hold):
-  #   1. CLI plugin is discovered by flux submit
-  #   2. jobtap policy gate builds, loads, and accepts/rejects by vendor
-  #   3. full token-free end-to-end: registry (flux inject) -> hold/reserve ->
-  #      scout (mock session) -> rendezvous handoff -> job runs
-  # ---------------------------------------------------------------------------
+  # needs a live broker
   integration:
     runs-on: ubuntu-latest
     container:
@@ -52,8 +61,11 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      FLUX_QUANTUM_MOCK: 1
     steps:
       - uses: actions/checkout@v4
+
       - name: install package into flux's python
         run: |
           flux python -m pip install -e . --break-system-packages \
@@ -63,22 +75,29 @@ jobs:
 
       - name: diagnostics
         run: |
+          echo "== flux =="; flux version
           echo "== flux python =="; flux python -c "import sys; print(sys.executable)"
-          echo "== is flux_quantum importable by flux python? =="
-          flux python -c "import flux_quantum, flux_quantum.cli; print('OK:', flux_quantum.__file__)" \
-            || echo "NOT importable by flux python"
-          echo "== cli-plugins dir =="; ls -la cli-plugins
+          flux python -c "import flux_quantum; print('OK:', flux_quantum.__file__)"
 
       - name: CLI plugin is discovered
         run: |
           export FLUX_CLI_PLUGINPATH=$PWD/cli-plugins
-          flux start flux submit --help 2>&1 | grep -E 'quantum' \
+          flux start flux submit --help 2>&1 | grep -E -- '--quantum-vendor' \
             || { echo "CLI plugin not discovered"; exit 1; }
+
+      - name: vendor backends contribute their own options
+        run: |
+          export FLUX_CLI_PLUGINPATH=$PWD/cli-plugins
+          out=$(flux start flux submit --help 2>&1)
+          for opt in --quantum-ibm-backend --quantum-braket-device --quantum-mock-session; do
+            echo "$out" | grep -q -- "$opt" || { echo "missing $opt"; exit 1; }
+            echo "  $opt OK"
+          done
 
       - name: jobtap plugin builds
         run: make -C flux_quantum/jobtap
 
-      - name: jobtap policy gate (load + accept/reject)
+      - name: jobtap policy gate (load + accept/reject by vendor)
         run: |
           cat > /tmp/jt.sh <<'SH'
           set -e
@@ -92,7 +111,28 @@ jobs:
           SH
           flux start bash /tmp/jt.sh
 
-      - name: full token-free end-to-end (mock vendor)
+      # one submit gives a held classical and a scout, and the qpu stays
+      # allocated until the classical is done
+      - name: end-to-end, single broker
+        run: flux start bash tests/integration/test-mock-e2e.sh
+
+      # two ranks, so the pair can be placed on different ranks
+      - name: end-to-end, two broker ranks
+        run: flux start -s2 bash tests/integration/test-mock-e2e.sh
+
+      # vendors discovered from the graph rather than named
+      - name: vendor discovery + --quantum-select
+        run: flux start bash tests/integration/test-select-discovery.sh
+
+      # this test expects fluxion already loaded, as rc1 does on a real cluster
+      - name: system-instance test (fluxion preloaded, 2 ranks)
         run: |
-          export FLUX_QUANTUM_MOCK=1
-          flux start bash tests/integration/test-mock-e2e.sh
+          cat > /tmp/sys.sh <<'SH'
+          set -e
+          flux module remove -f sched-simple 2>/dev/null || true
+          flux module load sched-fluxion-resource match-format=rv1
+          flux module load sched-fluxion-qmanager
+          export FLUX_CLI_PLUGINPATH=$PWD/cli-plugins
+          bash tests/integration/test-system-instance.sh
+          SH
+          flux start -s2 bash /tmp/sys.sh

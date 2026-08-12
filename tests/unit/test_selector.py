@@ -10,7 +10,7 @@ def test_no_usable_vendor_raises(backends_real):
     sel = _selector()
     with pytest.raises(sel.SelectionError) as e:
         sel.select_vendor()
-    # error lists each vendor's missing creds
+    # error lists the missing creds for each vendor
     assert "QISKIT_IBM_TOKEN" in str(e.value)
 
 

@@ -63,11 +63,7 @@ RUN apt-get update && \
         g++ && \
     rm -rf /var/lib/apt/lists/*
 
-# Python build/test/doc helpers. On Noble (24.04) the system Python is
-# PEP-668 "externally managed", so --break-system-packages is required for a
-# system pip install (fine for a throwaway build image). Old markupsafe /
-# jsonschema pins are dropped -- they don't play with Python 3.12 or a modern
-# flux-core.
+# "I am a bad person because I break system packages"
 RUN pip install --break-system-packages --upgrade --ignore-installed \
         coverage cffi ply six pyyaml jsonschema \
         sphinx sphinx-rtd-theme sphinxcontrib-spelling
@@ -144,8 +140,6 @@ RUN mkdir -p /var/run/munge && \
     chown -R munge /etc/munge/munge.key /var/run/munge && \
     chmod 600 /etc/munge/munge.key
 
-# flux-core: bumped to latest (was 0.61.2); still autotools from the release
-# tarball. --with-flux-security enables signing/IMP (built above).
 ARG FLUX_CORE_VERSION=0.87.0
 RUN wget https://github.com/flux-framework/flux-core/releases/download/v${FLUX_CORE_VERSION}/flux-core-${FLUX_CORE_VERSION}.tar.gz && \
     tar xzvf flux-core-${FLUX_CORE_VERSION}.tar.gz && \
@@ -174,19 +168,11 @@ RUN sudo apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 ENV LD_LIBRARY_PATH=/opt/miniconda/lib
-
-# CMake: bumped to 3.26.4 (was 3.23.1). flux-sched's CMakePresets.json is
-# schema version 6, which requires CMake >= 3.25. uname -m covers x86_64/arm.
 ENV CMAKE=3.26.4
 RUN curl -s -L https://github.com/Kitware/CMake/releases/download/v$CMAKE/cmake-$CMAKE-linux-$(uname -m).sh > cmake.sh && \
     sudo sh cmake.sh --prefix=/usr/local --skip-license && \
     rm cmake.sh
 
-# flux-sched: build from the add-hold branch of vsoch/flux-sched (hold/unhold +
-# reserve-only verb + reserve-first). This is a git checkout, not a release
-# tarball, so we use the CMake preset build (the ./configure path is gone for
-# git builds). No submodules to init. Installs into /usr so its fluxion modules
-# match the flux-core installed above.
 ARG FLUX_SCHED_REPO=https://github.com/vsoch/flux-sched
 ARG FLUX_SCHED_BRANCH=add-hold
 ENV FLUX_SCHED_VERSION=0.59.0

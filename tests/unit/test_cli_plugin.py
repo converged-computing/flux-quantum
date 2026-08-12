@@ -1,6 +1,9 @@
+import importlib.util
+import json
+import os
 import sys
 import types
-import importlib
+
 import pytest
 
 
@@ -33,10 +36,7 @@ def stub_flux_cli(monkeypatch):
 
 
 def _load_shim():
-    """Load cli-plugins/quantum.py by path, exactly as flux's loader does."""
-    import importlib.util
-    import os
-
+    """Load the quantum plugin by path, the way the flux loader does."""
     path = os.path.join(
         os.path.dirname(__file__), "..", "..", "cli-plugins", "quantum.py"
     )
@@ -86,37 +86,27 @@ def _make_args(**kw):
 
 
 def test_preinit_uses_registry_discovery(stub_flux_cli, monkeypatch):
-    # stub a flux handle so _discover_candidates can "open" one
-    import sys
-
+    # stub a flux handle so _discover_candidates can open one
     sys.modules["flux"].Flux = lambda *a, **k: object()
     cli = importlib.import_module("flux_quantum.cli")
 
-    # registry reports only ibm+braket (no creds under mock env) -> no usable
-    monkeypatch.setattr(
-        cli, "discover_registry_vendors", lambda h: {"ibm", "braket"}, raising=False
-    )
-    # discover_registry_vendors is imported lazily inside the method, so patch
-    # it at the selector module too
-    import flux_quantum.selector as sel
-
-    monkeypatch.setattr(sel, "discover_registry_vendors", lambda h: {"ibm", "braket"})
+    # only ibm and braket in the graph, and neither has creds under the mock
+    # env, so nothing is usable
+    monkeypatch.setattr(cli, "discover_registry_vendors", lambda h: {"ibm", "braket"})
     plugin = cli.QuantumCLIPlugin("submit")
-    import pytest
-
     with pytest.raises(SystemExit):
         plugin.preinit(_make_args(vendor=None, select="any"))
 
-    # registry reports mock -> selected mock
-    monkeypatch.setattr(sel, "discover_registry_vendors", lambda h: {"mock"})
+    # mock in the graph, so mock is selected
+    monkeypatch.setattr(cli, "discover_registry_vendors", lambda h: {"mock"})
     plugin2 = cli.QuantumCLIPlugin("submit")
     plugin2.preinit(_make_args(vendor=None, select="any"))
     assert plugin2._chosen == "mock"
 
 
 class _FakeJS:
-    """Minimal stand-in for flux.job.Jobspec: wraps a dict, supports the dotted
-    setattr/getattr under attributes that the plugin uses."""
+    """Minimal stand in for a flux Jobspec. Wraps a dict and supports the
+    dotted setattr and getattr the plugin uses."""
 
     def __init__(self, resources):
         self.jobspec = {"resources": resources, "attributes": {}}
@@ -201,8 +191,6 @@ def _run_prepare(
     calls = {"submitted": [], "populated": [], "cancelled": []}
 
     def default_submit(handle, jobspec_json):
-        import json
-
         calls["submitted"].append(json.loads(jobspec_json))
         return 12345
 
@@ -228,7 +216,7 @@ def _run_prepare(
 def test_prepare_pair_submits_held_wrapped_classical(stub_flux_cli):
     main_id, js, calls = _run_prepare(stub_flux_cli)
     assert main_id == 12345
-    # the CLASSICAL that was submitted: held, wrapped, vendor stamped
+    # held, wrapped, vendor stamped
     classical = calls["submitted"][0]
     sysattr = classical["attributes"]["system"]
     assert sysattr["hold"] == 1
@@ -241,8 +229,7 @@ def test_prepare_pair_submits_held_wrapped_classical(stub_flux_cli):
 
 def test_prepare_pair_rewrites_jobspec_into_scout(stub_flux_cli):
     main_id, js, calls = _run_prepare(stub_flux_cli)
-    # the jobspec flux will submit is now the SCOUT: has the qpu, is NOT held,
-    # and runs scout.py referencing the held classical id
+    # what flux submits is now the scout
     types = [r["type"] for r in js.jobspec["resources"]]
     assert any(t.startswith("qdevice_") for t in types)
     assert "hold" not in js.jobspec.get("attributes", {}).get("system", {})
@@ -269,13 +256,12 @@ def test_prepare_pair_cancels_held_classical_on_populate_failure(stub_flux_cli):
 
     with pytest.raises(SystemExit):
         _run_prepare(stub_flux_cli, populate=boom_populate, cancel=rec_cancel)
-    # the held classical must be cancelled so it does not sit forever
+
     assert calls_seen.get("cancelled") == 12345
 
 
 def test_scout_duration_covers_the_classical(stub_flux_cli):
-    """The scout now outlives the classical (it holds the qpu allocation), so it
-    must not be given a shorter walltime than the job it is holding it for."""
+    """The scout outlives the classical, so it needs at least its walltime."""
     from flux_quantum import cli
 
     js = _fake_jobspec(["myprog"])
@@ -294,7 +280,7 @@ def test_scout_duration_covers_the_classical(stub_flux_cli):
 
 
 def test_unlimited_classical_keeps_scout_unlimited(stub_flux_cli):
-    """duration 0 means no limit; it must stay 0, not become a finite number."""
+    """duration 0 means no limit and must stay 0."""
     from flux_quantum import cli
 
     js = _fake_jobspec(["myprog"])

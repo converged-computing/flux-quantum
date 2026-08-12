@@ -3,7 +3,7 @@ def test_real_backends_registered(backends_real):
 
 
 def test_mock_gated_by_env(backends_real, backends_mock):
-    # note: fixtures import fresh; check each independently below instead
+    # fixtures import fresh, so check each one independently below
     pass
 
 

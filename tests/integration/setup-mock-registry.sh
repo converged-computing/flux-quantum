@@ -1,23 +1,18 @@
 #!/bin/bash
-##############################################################
-# Populate the LIVE fluxion graph with a token-free quantum vendor REGISTRY:
-# qdevice_* marker vertices the CLI plugin/selector discover via find (used by
-# --quantum-select auto-pick). Markers are plain graph vertices added with
-# `flux ion-resource add-subgraph` -- no vendor API, no token.
+# Populate the live fluxion graph with qdevice marker vertices, so the selector
+# has something to discover with find. These are plain graph vertices, no
+# vendor API and no token.
 #
-# Unlike load-file, add-subgraph works WITH qmanager: fluxion is loaded normally
-# (real acquire, clean qmanager handshake) and the markers are grown into the
-# already-running graph. (A load-file graph cannot handshake with qmanager:
-# "cannot notify when load-file set".)
+# add-subgraph works with qmanager, unlike load-file. Fluxion is loaded the
+# normal way and the markers are grown into the running graph. A load-file
+# graph cannot handshake with qmanager at all.
 #
-# Run INSIDE the container, in a flux instance with flux-sched@add-hold.
-# Vendors default to: mock ibm braket.
-##############################################################
+# Run inside the container, in a flux instance with flux-sched add-hold.
+# Vendors default to mock ibm braket.
 set -eu
 VENDORS="${VENDORS:-mock ibm braket}"
 SUB="${SUB:-/tmp/quantum-subgraph.json}"
 LIVE="${LIVE:-/tmp/live-graph.json}"
-SELF=$(cd "$(dirname "$0")" && pwd)
 
 echo "-- release preloaded scheduler; load fluxion + qmanager NORMALLY --"
 flux module remove -f sched-fluxion-qmanager 2>/dev/null || true

@@ -1,7 +1,7 @@
-"""IBM Quantum backend (via QRMI or the IBM Runtime API).
+"""IBM Quantum backend, via QRMI or the IBM Runtime API.
 
-MOCK probe for now: real impl calls the vendor with the user's token to read
-queue depth / cost. Credential check looks for the user's token in the env.
+The probe is a stub. The real one reads queue depth and cost with the user
+token.
 """
 
 import os
@@ -11,7 +11,7 @@ from .base import Backend, Signals, register
 @register
 class IBMBackend(Backend):
     name = "ibm"
-    #: env vars the user must have exported for IBM
+    # env vars the user must have exported for IBM
     required_env = ("QISKIT_IBM_TOKEN",)
 
     @classmethod
@@ -43,9 +43,8 @@ class IBMBackend(Backend):
         }
 
     def open_session(self, options):
-        # REAL IMPL (vendor-API phase): using the user's QISKIT_IBM_TOKEN, open a
-        # QRMI/Runtime session on options["backend"] (with instance/shots) and
-        # return its id. Deferred so the mock pipeline can ship first.
+        # TODO open a QRMI or Runtime session on the requested backend with
+        # the user token and return the session id
         raise NotImplementedError(
             "IBM open_session not yet implemented; use --quantum-vendor mock "
             "with FLUX_QUANTUM_MOCK for now (options captured: {})".format(options)
@@ -58,8 +57,7 @@ class IBMBackend(Backend):
         return True, "IBM: credentials present"
 
     def probe(self):
-        # REAL IMPL: query IBM/QRMI with the user's token for live queue/cost.
-        # e.g. depth = qrmi.queue_depth(backend); cost = qrmi.cost(backend)
+        # TODO query IBM or QRMI for live queue depth and cost
         return Signals(
             available=True, queue_depth=None, cost=None, detail={"note": "mock probe"}
         )

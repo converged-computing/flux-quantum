@@ -1,15 +1,13 @@
 #!/bin/bash
-##############################################################
-# Token-free test of the AUTO-SELECT / discovery path:
-#   registry markers (add-subgraph) -> CLI plugin discovers vendors from the
-#   fluxion graph (NOT just backends) -> selects the usable one -> held ->
-#   scout -> handoff. Complements test-mock-e2e.sh (which uses an explicit
-#   vendor and never exercises graph discovery).
+# Token free test of the auto select path. Markers go into the graph, the CLI
+# plugin discovers vendors from the graph rather than from the backends, picks
+# the usable one, and the usual held job and scout follow. test-mock-e2e.sh
+# names a vendor, so it never covers discovery.
 #
-# Discriminating check: the graph carries mock/ibm/braket but NOT mock_busy,
-# while mock_busy IS a registered backend. So if the plugin's candidate list
-# contains mock_busy it fell back to backends; if it lists exactly the graph
-# vendors, discovery genuinely read the graph.
+# The check works because the graph carries mock, ibm and braket but not
+# mock_busy, while mock_busy is a registered backend. A candidate list with
+# mock_busy in it means the plugin fell back to the backends. A list matching
+# the graph exactly means discovery really read the graph.
 #
 #   flux start bash tests/integration/test-select-discovery.sh
 ##############################################################
@@ -25,10 +23,11 @@ VENDORS="mock ibm braket" bash "$SELF/setup-mock-registry.sh" || exit 1
 
 echo ""
 echo "=== 2. submit with --quantum-select any (NO explicit vendor) ==="
-cid=$(flux submit --quantum-select any -n1 \
-        flux python "$HERE/flux_quantum/wrap.py" \
+# the plugin wraps the command itself, so do not pass wrap.py here
+scout_id=$(flux submit --quantum-select any --quantum-mock-session AUTOSESS456 -n1 \
         -- sh -c 'echo QUANTUM_SESSION=$QUANTUM_SESSION_ID' 2>"$ERR")
-echo "submitted: $cid"
+main_id=$(grep -oE 'held classical job [0-9]+' "$ERR" | awk '{print $NF}')
+echo "scout=$scout_id  classical=$main_id"
 echo "--- plugin stderr ---"; sed 's/^/    /' "$ERR"
 
 echo ""
@@ -47,29 +46,26 @@ grep -q "selected: mock" "$ERR" \
 
 echo ""
 echo "=== 4. full pipeline: SCOUT co-allocates core + qdevice_mock->qpu, unholds main ==="
-sleep 1
-st=$(flux jobs -no '{state}' "$cid" 2>/dev/null)
-echo "state (expect SCHED, i.e. held): $st"
-# The scout is now a real job that REQUESTS classical + quantum (slot -> [core,
-# qdevice_mock->qpu]); fluxion must match it against the injected graph before it
-# can run, open the (mock) session, and unhold the main. A bare `flux run -n1`
-# would not exercise the quantum match at all.
-scout_id=$(flux python "$HERE/flux_quantum/launch.py" \
-        --job "$cid" --vendor mock --session AUTOSESS456)
-echo "scout submitted (requests core + qdevice_mock->qpu): $scout_id"
-if ! flux job wait-event -t 20 "$scout_id" clean </dev/null; then
-    echo "FAIL: scout never ran -- the core+qpu coschedule match failed"
-    flux job attach "$scout_id" 2>&1 | sed 's/^/    /'
+# the submit already produced the pair. The scout has to match slot->core plus
+# qdevice_mock->qpu against the injected graph, so this covers the coschedule.
+if [ -z "$main_id" ] || [ -z "$scout_id" ]; then
+    echo "FAIL: the plugin did not produce a classical+scout pair"; exit 1
+fi
+if ! flux job wait-event -t 30 "$main_id" clean </dev/null; then
+    echo "FAIL: classical never completed"
+    flux jobs -a | sed 's/^/    /'
+    flux job attach "$scout_id" </dev/null 2>&1 | sed 's/^/    /'
     exit 1
 fi
-echo "PASS: scout matched core + qdevice_mock->qpu and ran"
-flux job wait-event -t 20 "$cid" clean </dev/null
-out=$(flux job attach "$cid" </dev/null 2>&1)
+echo "PASS: scout matched core + qdevice_mock->qpu and released the classical"
+out=$(flux job attach "$main_id" </dev/null 2>&1)
 if echo "$out" | grep -q "AUTOSESS456"; then
-    echo "PASS: main ran with handed-off session (AUTOSESS456)"
+    echo "PASS: main ran with the handed-off session (AUTOSESS456)"
 else
     echo "FAIL: session not observed"; echo "--- output ---"; echo "$out"; rc=1
 fi
+# the scout exits after the classical
+flux job wait-event -t 30 "$scout_id" clean </dev/null >/dev/null 2>&1 || true
 
 echo "=== check the instance log for errors DURING the run (before teardown) ==="
 errs=$(flux dmesg 2>&1 | grep -iE "\.err\[[0-9]+\]|: error:|fatal" || true)
@@ -77,7 +73,7 @@ if [ -n "$errs" ]; then
     echo "FAIL: instance logged errors during the run:"; echo "$errs"; rc=1
 fi
 
-# graceful teardown so shutdown does not log 'acquire ... Operation canceled'
+# graceful teardown so shutdown does not log an acquire failure
 flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
 flux module remove -f sched-fluxion-resource 2>/dev/null || true
 
