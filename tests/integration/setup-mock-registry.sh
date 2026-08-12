@@ -15,10 +15,13 @@ SUB="${SUB:-/tmp/quantum-subgraph.json}"
 LIVE="${LIVE:-/tmp/live-graph.json}"
 
 echo "-- release preloaded scheduler; load fluxion + qmanager NORMALLY --"
+# reverse dependency order, feasibility sits between resource and qmanager
 flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
+flux module remove -f sched-fluxion-feasibility 2>/dev/null || true
 flux module remove -f sched-fluxion-resource 2>/dev/null || true
 flux module remove -f sched-simple 2>/dev/null || true
 flux module load sched-fluxion-resource
+flux module load sched-fluxion-feasibility 2>/dev/null || true
 flux module load sched-fluxion-qmanager
 
 echo "-- populate qdevice_<vendor> -> qpu into the live graph (find + add_subgraph RPC) --"

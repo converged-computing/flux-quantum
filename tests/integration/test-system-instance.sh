@@ -28,6 +28,12 @@ flux submit --help 2>&1 | grep -q -- --quantum-vendor || {
     echo "FAIL: no --quantum options. Is FLUX_CLI_PLUGINPATH set?"; exit 1; }
 flux submit --help 2>&1 | grep -- --quantum- | sed 's/^/    /'
 
+# Remember how much log there is before we start. This is a long lived
+# instance, so everything since boot is still in the ring buffer and an
+# unrelated error from an hour ago is not our problem. Counting lines rather
+# than parsing timestamps keeps this working whatever the log format is.
+DMESG_MARK=$(flux dmesg 2>/dev/null | wc -l)
+
 echo ""
 echo "=== 4. one quantum submit -> held classical + scout ==="
 SID="systest-$(date +%s)"
@@ -91,7 +97,11 @@ fi
 
 echo ""
 echo "=== 8. instance log errors during the run ==="
-errs=$(flux dmesg 2>&1 | grep -iE "\.err\[[0-9]+\]|: error:|fatal" || true)
+# only what was logged after the mark, and rexec complaints are not ours. They
+# come from flux exec, which the scout and the classical never use.
+errs=$(flux dmesg 2>/dev/null | tail -n +$((DMESG_MARK + 1)) \
+    | grep -iE "\.err\[[0-9]+\]|: error:|fatal" \
+    | grep -v "rexec" || true)
 if [ -n "$errs" ]; then
     echo "FAIL: errors logged:"; echo "$errs" | sed 's/^/    /'; rc=1
 fi

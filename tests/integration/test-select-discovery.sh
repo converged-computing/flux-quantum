@@ -75,6 +75,7 @@ fi
 
 # graceful teardown so shutdown does not log an acquire failure
 flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
+flux module remove -f sched-fluxion-feasibility 2>/dev/null || true
 flux module remove -f sched-fluxion-resource 2>/dev/null || true
 
 rm -f "$ERR"
