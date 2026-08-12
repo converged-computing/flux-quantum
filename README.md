@@ -4,7 +4,7 @@ I am developing this against flux-core **flux-core 0.87.0** and my custom branch
 sched with support for hold. The quantum backend is external (e,g., IBM/QRMI, AWS Braket)
 and informs the work for the flux-sched reservation being held for classical resources.
 ## Components
-- **flux_quantum/cli.py** the CLI plugin that runs in user space and (if needed) can use credentials to look at queue depth or cost. 
+- **flux_quantum/cli.py** the CLI plugin that runs in user space and (if needed) can use credentials to look at queue depth or cost.
 - **flux_quantum/backends/** the vendor libraries. E.g., handling braket will be different than IBM or qrmi, and how we validate will vary. These also run only in user-space.
 - **flux_quantum/selector.py** is generic discover and rank over backends.
 - **flux_quantum/validator.py** is going to check that we have the right envars, etc. per a backend choice.
@@ -21,7 +21,7 @@ imports `QuantumCLIPlugin` from the installed package -- do NOT point
 `FLUX_CLI_PLUGINPATH` at `flux_quantum/` itself, or flux will try to import the
 package's internal modules as standalone plugins and fail. For a system install,
 copy `cli-plugins/quantum.py` into `{confdir}/cli/plugins`.
-For the jobtap plugin:  
+For the jobtap plugin:
 ```bash
 make -C flux_quantum/jobtap  &&  flux jobtap load .../quantum.so
 ```

@@ -14,6 +14,7 @@ shape comes from ``qresource``; this module only does the RPCs. Because the RPCs
 are owner-only, a user can populate their OWN subinstance's graph but not the
 system graph.
 """
+
 import json
 
 from . import qresource
@@ -29,7 +30,8 @@ def get_live_graph(handle, criteria="status=up"):
     except Exception as exc:
         raise RuntimeError(
             "sched-fluxion-resource.find RPC failed (is fluxion loaded, and are "
-            "you the instance owner?): {}".format(exc))
+            "you the instance owner?): {}".format(exc)
+        )
     if "R" not in resp:
         raise RuntimeError("find response missing 'R': {!r}".format(resp))
     doc = resp["R"]
@@ -48,7 +50,7 @@ def vendors_present(graph):
     for n in graph["nodes"]:
         t = n["metadata"]["type"]
         if t.startswith(qresource.QDEVICE_PREFIX):
-            out.add(t[len(qresource.QDEVICE_PREFIX):])
+            out.add(t[len(qresource.QDEVICE_PREFIX) :])
     return out
 
 
@@ -75,5 +77,6 @@ def populate(handle, vendors, qpus=1, graph=None):
     except Exception as exc:
         raise RuntimeError(
             "sched-fluxion-resource.add_subgraph RPC failed for vendors {}: "
-            "{}".format(missing, exc))
+            "{}".format(missing, exc)
+        )
     return set(missing)

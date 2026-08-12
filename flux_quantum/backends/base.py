@@ -10,6 +10,7 @@ in the owner-side jobtap plugin.
 Add a vendor == add a Backend subclass and register it. The core never learns a
 vendor's API; a backend never learns about job lifecycle.
 """
+
 from abc import ABC, abstractmethod
 
 
@@ -17,14 +18,15 @@ class Signals:
     """Live signals for one vendor, returned by Backend.probe()."""
 
     def __init__(self, available, queue_depth=None, cost=None, detail=None):
-        self.available = bool(available)   # is the vendor usable right now?
-        self.queue_depth = queue_depth     # pending jobs ahead (lower better), or None
-        self.cost = cost                   # relative/absolute cost (lower better), or None
-        self.detail = detail or {}         # free-form extras for logging/policy
+        self.available = bool(available)  # is the vendor usable right now?
+        self.queue_depth = queue_depth  # pending jobs ahead (lower better), or None
+        self.cost = cost  # relative/absolute cost (lower better), or None
+        self.detail = detail or {}  # free-form extras for logging/policy
 
     def __repr__(self):
         return "Signals(available={}, queue_depth={}, cost={})".format(
-            self.available, self.queue_depth, self.cost)
+            self.available, self.queue_depth, self.cost
+        )
 
 
 class Backend(ABC):
@@ -62,7 +64,22 @@ class Backend(ABC):
         logic. Override per vendor; the default makes the omission explicit.
         """
         raise NotImplementedError(
-            "{}: open_session is not implemented for this vendor".format(self.name))
+            "{}: open_session is not implemented for this vendor".format(self.name)
+        )
+
+    def close_session(self, session=None):
+        """Release the vendor session opened by open_session().
+
+        Runs in the SCOUT job after the classical job has finished, so the
+        vendor acquisition lasts exactly as long as the fluxion qpu allocation.
+        Backends that hold vendor state (e.g. a QRMI acquisition lock) should
+        stash it on self during open_session and release it here.
+
+        Default: no-op, for vendors with nothing to release (e.g. Braket
+        on-demand, where a task carries its own reservation ARN and there is no
+        session to close).
+        """
+        return
 
     @abstractmethod
     def credentials_present(self):
