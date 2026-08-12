@@ -1,26 +1,17 @@
 #!/usr/bin/env python3
-##############################################################
-# Build and submit the quantum SCOUT job.
+# Build and submit the scout job.
 #
-# The scout requests a small classical foothold AND the selected vendor's
-# quantum device from the resource graph, in ONE slot:
+# The scout asks for a small classical foothold and the vendor device, so
+# fluxion co-allocates a core and a qpu. That match is the coschedule. When the
+# scout runs it opens the vendor session and releases the held classical job.
 #
-#     slot -> [ core , qdevice_<vendor> -> qpu ]
-#
-# so fluxion co-allocates a core and a qpu for it. THIS is the coschedule match
-# against the quantum vertices modeled in the graph (see `flux inject` / the
-# add-subgraph helper). When the scout runs it opens the vendor session (the
-# backend may be mocked) and unholds the paired, larger classical job.
-#
-# The mock replaces only the vendor API/session -- the graph match is real: if
-# qdevice_<vendor> -> qpu is not in the graph, the scout is unsatisfiable and
-# never runs, exactly as intended.
-##############################################################
+# The mock only replaces the vendor API. The graph match is real, so if
+# qdevice_<vendor> -> qpu is missing the scout is unsatisfiable and never runs.
 import argparse
 import json
 import os
 
-from . import qresource
+from flux_quantum import qresource
 
 
 def build_scout_jobspec(
@@ -35,14 +26,9 @@ def build_scout_jobspec(
 ):
     """Return a v1 jobspec dict for the scout.
 
-    Requests a classical foothold AND the vendor's quantum device as TWO
-    top-level resources: a node-level slot (node->slot->core) AND a separate
-    qdevice_<vendor> -> qpu (from qresource.jobspec_resource, exclusive). The
-    qdevice is a rack-level device (a sibling of rack, like an ssd) in a
-    different subtree than the node's cores; fluxion cannot place ONE slot
-    spanning both subtrees, so two top-level resources -- the proven issue1284
-    pattern -- is used. NOTE: the classical descent (node->slot->core) matches a
-    socketless graph; a socketed (hwloc) deployment needs node->socket->...->core.
+    The foothold and the qdevice are two top level resources rather than one
+    slot. The qdevice is a sibling of rack, so it sits in a different subtree
+    than the node cores and fluxion cannot place one slot across both.
     """
     if scout_path is None:
         scout_path = os.path.join(
@@ -51,15 +37,13 @@ def build_scout_jobspec(
     command = ["flux", "python", scout_path, "--job", str(hold_job), "--vendor", vendor]
     if session:
         command += ["--session", session]
-    # vendor-specific options (from the backend's scout_options) travel to the
-    # scout as JSON; the backend's open_session consumes them.
+    # options from scout_options travel to the scout as JSON, where
+    # open_session consumes them
     if options:
-        import json as _json
-
-        command += ["--options", _json.dumps(options)]
-    # classical foothold: derived from the live graph so the node->...->core
-    # path matches the real hierarchy (socket or not). Falls back to
-    # node->slot->core when no graph is available (e.g. unit tests).
+        command += ["--options", json.dumps(options)]
+    # classical foothold, derived from the live graph so the node to core path
+    # matches the real hierarchy, socket or not. Falls back to node->slot->core
+    # when no graph is available, as in unit tests.
     if live_graph is not None:
         classical = qresource.classical_resource(
             live_graph, ncores=ncores, label="scout"
@@ -81,9 +65,8 @@ def build_scout_jobspec(
         "version": 1,
         "resources": [
             classical,
-            # quantum device: qdevice_<vendor> -> qpu, exclusive so it lands in
-            # R (see qresource.jobspec_resource). ONE shape source, shared with
-            # the graph populator.
+            # quantum device qdevice_<vendor> -> qpu, exclusive so it lands in
+            # R. One shape source, shared with the graph populator.
             qresource.jobspec_resource(vendor),
         ],
         "attributes": {"system": {"duration": duration}},
@@ -92,7 +75,7 @@ def build_scout_jobspec(
 
 
 def submit_scout(handle, vendor, hold_job, ncores=1, duration=0, session=None):
-    """Submit the scout job; return its flux JobID."""
+    """Submit the scout job and return the flux JobID."""
     from flux.job import submit
 
     jobspec = build_scout_jobspec(vendor, hold_job, ncores, duration, session=session)

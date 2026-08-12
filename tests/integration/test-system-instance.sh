@@ -1,29 +1,17 @@
 #!/bin/bash
-##############################################################
-# End-to-end test of the PRODUCTION pipeline against a RUNNING SYSTEM INSTANCE
-# (multi-node, fluxion already loaded by rc1) rather than a personal
-# `flux start -s1` instance -- that case is covered by test-mock-e2e.sh.
+# Same pipeline as test-mock-e2e.sh, but against a running system instance with
+# fluxion already loaded, where the scout and the classical can land on
+# different nodes.
 #
-# This is the test that matters for a real deployment, because it is the only
-# one where the scout and the classical can land on DIFFERENT NODES. The session
-# handoff rides the classical job's eventlog (job-manager.memo), so it must work
-# with no shared filesystem between them.
-#
-# Token-free: FLUX_QUANTUM_MOCK selects the mock vendor.
-#
-#   flux-quantum-system-test            # uses --quantum-vendor mock
-#
-# Requires: fluxion loaded with match-format=rv1, FLUX_CLI_PLUGINPATH pointing
-# at the repo's cli-plugins/ dir, and >= 2 cores so the scout has a foothold
-# while the classical holds its reservation.
-##############################################################
+# Requires fluxion loaded with match-format=rv1, FLUX_CLI_PLUGINPATH set, and
+# >=2 cores so the scout has a foothold while the classical holds its
+# reservation.
 set -u
 
 : "${FLUX_QUANTUM_MOCK:=1}"; export FLUX_QUANTUM_MOCK
 rc=0
 
-# wrap.py's own guard is 60s; wait longer than that so its explicit error
-# surfaces instead of this script timing out first and blaming the wrong thing.
+# longer than the 60s guard in wrap.py, so its error surfaces first
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-180}"
 
 echo "=== 1. instance is up ==="
@@ -76,9 +64,7 @@ if flux job wait-event -t "$WAIT_TIMEOUT" "$main" clean </dev/null >/dev/null 2>
         rc=1
     fi
 else
-    # Distinguish "never released" from "released but wrap.py could not read the
-    # session" -- these have completely different causes and the job state says
-    # which. A held job sits in SCHED; a released one reaches RUN.
+    # a held job sits in SCHED, a released one reaches RUN
     st=$(flux jobs -no "{state}" "$main" 2>/dev/null)
     echo "FAIL: classical did not complete (state=$st)"
     if [ "$st" = "SCHED" ]; then
@@ -94,7 +80,7 @@ fi
 
 echo ""
 echo "=== 7. the session on the classical job's eventlog ==="
-# The memo IS the handoff -- showing it makes a failure diagnosable in one look.
+# the memo is the handoff, so show it
 if flux job eventlog "$main" 2>/dev/null | grep -q '"quantum_session"'; then
     flux job eventlog "$main" | grep memo | sed 's/^/    /'
 else

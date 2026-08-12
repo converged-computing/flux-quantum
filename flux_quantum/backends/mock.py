@@ -1,21 +1,17 @@
-"""Mock vendor backend(s) for token-free testing.
+"""Mock vendors for token free testing.
 
-Registers mock vendors whose credentials are always "present" and whose probe
-never calls a real API, so the whole pipeline -- discovery, selection,
-validation, and the scout session handoff -- runs with NO real vendor token.
+Only registered when FLUX_QUANTUM_MOCK is set, so production never sees them.
+There are two so ranking policies can be exercised without credentials.
 
-Opt-in: these are only registered when FLUX_QUANTUM_MOCK is set, so production
-never silently exposes a mock vendor (see backends/__init__.py).
+    mock       queue_depth 0, wins --select any
+    mock_busy  queue_depth 9, so --select queue prefers mock
 
-Two mocks are provided so ranking policies can be exercised without creds:
-    mock       queue_depth 0  (default winner for --select any)
-    mock_busy  queue_depth 9  (so --select queue prefers 'mock')
-Tunables (override 'mock' only) for ad-hoc ranking tests:
-    FLUX_QUANTUM_MOCK_QUEUE   int
-    FLUX_QUANTUM_MOCK_COST    float
+FLUX_QUANTUM_MOCK_QUEUE and FLUX_QUANTUM_MOCK_COST override the mock vendor.
 """
 
 import os
+import time
+
 from .base import Backend, Signals, register
 
 
@@ -45,8 +41,6 @@ class MockBackend(Backend):
         }
 
     def open_session(self, options):
-        import time
-
         latency = options.get("latency")
         if latency:
             time.sleep(float(latency))

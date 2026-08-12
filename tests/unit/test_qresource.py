@@ -14,7 +14,7 @@ def test_jobspec_resource_requests_exclusive_qpu():
     assert r["count"] == 1
     qpu = r["with"][0]
     assert qpu["type"] == "qpu"
-    # exclusive is REQUIRED: a non-exclusive leaf device is dropped from R
+    # exclusive is required or the leaf device is dropped from R
     assert qpu["exclusive"] is True
 
 
@@ -72,7 +72,7 @@ def test_graph_subgraph_multi_vendor_unique_ids():
 
 
 def test_graph_subgraph_and_jobspec_agree_on_type():
-    """The whole point: graph and jobspec use the SAME type string."""
+    """Graph and jobspec have to use the same type string."""
     sg = qr.graph_subgraph(_live(), ["ibm"])
     jr = qr.jobspec_resource("ibm")
     graph_types = {n["metadata"]["type"] for n in sg["graph"]["nodes"]}

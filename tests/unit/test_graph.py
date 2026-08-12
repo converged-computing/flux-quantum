@@ -13,7 +13,7 @@ class _FakeRPC:
 
 
 class _FakeHandle:
-    """Records add_subgraph payloads; returns a canned graph for find."""
+    """Records add_subgraph payloads and returns a canned graph for find."""
 
     def __init__(self, graph):
         self._graph = graph

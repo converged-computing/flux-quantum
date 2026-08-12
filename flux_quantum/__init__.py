@@ -1,8 +1,8 @@
-"""flux-quantum: quantum + classical coscheduling components for Flux.
+"""Quantum and classical coscheduling components for Flux.
 
-Bundled and versioned together (per Flux packaging guidance): a submit-time
-CLI plugin (vendor selection), a job validator, an owner-side jobtap policy
-gate, vendor backends, and the scout/wrapper session-handoff pair.
+Bundled and versioned together, following Flux packaging guidance. A submit
+time CLI plugin, a job validator, an owner side jobtap gate, vendor backends,
+and the scout and wrapper pair that hand off the session.
 """
 
 __version__ = "0.0.1"

@@ -5,18 +5,14 @@
 # SPDX-License-Identifier: LGPL-3.0
 ##############################################################
 
-"""Single source of truth for the quantum-resource shape.
+"""The quantum resource shape, in one place.
 
-A vendor's quantum device is modeled as ``qdevice_<vendor> -> qpu``: a device
-subtree hung off the graph ROOT, i.e. a sibling of rack (a "rack-level" device,
-like an ssd) living in a different subtree than the node's cores. This module is
-the ONLY place that shape is written:
+A vendor device is qdevice_<vendor> -> qpu, hung off the graph root as a
+sibling of rack, so it sits in a different subtree than the node cores.
 
-  * the submit CLI plugin builds its jobspec request from ``jobspec_resource()``
-  * the graph populator builds its add_subgraph payload from ``graph_subgraph()``
-
-so the graph and the jobspec can never disagree on the type name, nesting, or
-exclusivity. Pure dict manipulation -- no flux imports, unit-testable.
+Both the jobspec request and the add_subgraph payload are built from here, so
+the graph and the jobspec cannot disagree on type name, nesting or
+exclusivity. No flux imports, just dicts.
 """
 
 QDEVICE_PREFIX = "qdevice_"
@@ -24,20 +20,17 @@ QPU = "qpu"
 
 
 def qdevice_type(vendor):
-    """Fluxion resource type for a vendor's quantum-device container vertex."""
+    """Fluxion resource type for a vendor device vertex."""
     return "{}{}".format(QDEVICE_PREFIX, vendor)
 
 
 def jobspec_resource(vendor, nqpus=1):
-    """A scout jobspec ``.resources`` entry requesting the vendor's device.
+    """A scout jobspec resources entry for the vendor device.
 
-    The qpu is requested EXCLUSIVE on purpose. Fluxion only allocates (adds a
-    planner span) and emits a leaf device into R when it is requested
-    exclusively; a non-exclusive leaf device is matched (it is required for
-    satisfiability) but silently dropped from the emitted allocation -- see
-    flux-sched ``upd_plan``, which does ``n++`` / ``planner_add_span`` only
-    inside ``if (excl)``. Without ``exclusive: true`` the qpu vanishes from R
-    with a misleading "allocated" result.
+    The qpu must be exclusive. Fluxion only adds a planner span and emits a
+    leaf device into R when it is asked for exclusively, since upd_plan calls
+    planner_add_span only inside the excl branch. Ask for it any other way and
+    it is matched but then dropped from the allocation.
     """
     return {
         "type": qdevice_type(vendor),
@@ -67,7 +60,7 @@ def _edge(src, tgt):
 
 
 def find_root(graph):
-    """Return the single root vertex of a JGF graph (no incoming containment)."""
+    """Return the root vertex of a JGF graph."""
     targets = {e["target"] for e in graph["edges"]}
     roots = [n for n in graph["nodes"] if n["id"] not in targets]
     if len(roots) != 1:
@@ -76,14 +69,11 @@ def find_root(graph):
 
 
 def graph_subgraph(live_graph, vendors, qpus=1):
-    """Build an ``add_subgraph`` payload planting ``qdevice_<vendor> -> qpu``
-    subtrees under the live graph root (each qdevice a sibling of rack).
+    """Build an add_subgraph payload planting qdevice_<vendor> -> qpu under the
+    live graph root.
 
-    ``live_graph`` is the ``{"nodes": [...], "edges": [...]}`` returned by
-    ``sched-fluxion-resource.find`` (``--format=jgf``). The root is copied
-    verbatim so fluxion's JGF reader matches it by (containment path, rank) and
-    attaches the new subtrees rather than duplicating the root. Returns
-    ``{"graph": {"nodes": [...], "edges": [...]}}``.
+    The root is copied verbatim so the fluxion JGF reader matches it on
+    containment path and rank, then attaches rather than duplicating it.
     """
     if isinstance(vendors, str):
         vendors = [vendors]
@@ -92,7 +82,7 @@ def graph_subgraph(live_graph, vendors, qpus=1):
     root_path = root["metadata"]["paths"]["containment"]
     next_id = max(int(n["id"]) for n in live_graph["nodes"]) + 1
 
-    nodes = [root]  # verbatim: matched by (path, rank), enters vmap not dup'd
+    nodes = [root]  # verbatim, so it is matched on path and rank
     edges = []
     for vendor in vendors:
         qd_id = next_id
@@ -112,12 +102,10 @@ def graph_subgraph(live_graph, vendors, qpus=1):
 
 
 def _node_to_core_intermediates(graph):
-    """Return the intermediate containment types between 'node' and 'core' in a
-    live graph (e.g. ['socket'] for an hwloc graph, [] for issue1284).
+    """Return the containment types between node and core.
 
-    Returns None if the graph has no node->...->core containment path (caller
-    then falls back). Derived from the graph so the classical foothold always
-    matches the real hierarchy rather than a hardcoded guess.
+    An hwloc graph gives socket, issue1284 gives nothing. Returns None when
+    there is no node to core path.
     """
     id2type = {n["id"]: n["metadata"]["type"] for n in graph["nodes"]}
     parent = {e["target"]: e["source"] for e in graph["edges"]}
@@ -131,18 +119,18 @@ def _node_to_core_intermediates(graph):
         cur = parent.get(cur)
     if id2type.get(cur) != "node":
         return None
-    chain.reverse()  # top-down order under the node
+    chain.reverse()
     return chain
 
 
 def classical_resource(live_graph, ncores=1, label="scout"):
-    """Build the scout's classical foothold, mirroring the live graph's
-    node->...->core path with a slot inserted just above the core.
+    """Build the classical foothold for the scout, mirroring the node to core
+    path in the live graph with a slot just above the core.
 
-    issue1284 (node->core)        -> node -> slot -> core
-    hwloc     (node->socket->core)-> node -> socket -> slot -> core
+        node->core          ->  node -> slot -> core
+        node->socket->core  ->  node -> socket -> slot -> core
 
-    If no node->core path is found, falls back to node -> slot -> core.
+    Falls back to node -> slot -> core when there is no node to core path.
     """
     intermediates = _node_to_core_intermediates(live_graph)
     if intermediates is None:

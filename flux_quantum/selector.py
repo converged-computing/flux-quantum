@@ -1,15 +1,14 @@
-"""Vendor selection: generic discovery + ranking over vendor backends.
+"""Vendor selection, meaning discovery and ranking over backends.
 
-Selection, not scheduling. Given a set of candidate vendors (either named by
-the user or discovered from the fluxion registry), probe each candidate's
-backend for live signals and pick one by a simple policy. Runs in userspace
-(the CLI plugin) because probing needs the user's credentials.
+This is selection and not scheduling. Probe each candidate backend for live
+signals and pick one by policy. Runs in userspace because probing needs the
+user credentials.
 
-Discovery of the fluxion "qdevice_*" registry (via the resource.find RPC) is
-optional and only used when the user does not name candidates explicitly; it is
-kept behind discover_registry_vendors() so the selector works with or without a
-live fluxion handle.
+Graph discovery is optional and only used when the user names no candidates, so
+the selector works with or without a flux handle.
 """
+
+import json
 
 from . import qresource
 from .backends import get_backend, known_vendors
@@ -20,7 +19,7 @@ class SelectionError(Exception):
 
 
 def _rank_key(policy):
-    """Return a sort key(fn) over (vendor, Signals) for the given policy."""
+    """Return a sort key over vendor and Signals for the given policy."""
     if policy in (None, "any", "available"):
         return lambda item: 0
     if policy == "queue":  # shortest queue first
@@ -31,18 +30,11 @@ def _rank_key(policy):
 
 
 def select_vendor(candidates=None, policy=None):
-    """Pick a vendor from *candidates* by *policy*.
+    """Pick a vendor from candidates by policy, one of any, queue or cost.
 
-    Args:
-        candidates: iterable of vendor names to consider. If None, all vendors
-            that have a registered backend are considered.
-        policy: "any"/"queue"/"cost" (default "any").
-
-    Returns:
-        (vendor_name, Signals, log_lines)
-
-    Raises SelectionError if no candidate is usable (creds missing / all
-    unavailable), with the per-candidate reasons in the message.
+    Passing no candidates means every vendor with a registered backend.
+    Returns the vendor, its Signals and the log lines. Raises SelectionError
+    with the reason for each candidate when nothing is usable.
     """
     names = list(candidates) if candidates else sorted(known_vendors())
     if not names:
@@ -80,15 +72,11 @@ def select_vendor(candidates=None, policy=None):
 
 
 def discover_registry_vendors(handle):
-    """Discover qdevice_* types from the live fluxion graph via resource.find.
+    """Return the vendor names present in the live graph as qdevice_* types.
 
-    Optional helper: returns the set of vendor names present in the registry
-    (the part after 'qdevice_'). Requires a flux handle. Returns empty set on
-    any error so callers can fall back to backend/user-named candidates.
+    Empty set on any error, so callers can fall back to the backends.
     """
     try:
-        import json
-
         resp = handle.rpc(
             "sched-fluxion-resource.find", {"criteria": "status=up", "format": "jgf"}
         ).get()

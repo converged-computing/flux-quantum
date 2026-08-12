@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
-##############################################################
-# quantum-wrap: startup wrapper for the classical (reservation) job. Reads the
-# vendor session id from THIS job's own eventlog (posted as a memo by the scout
-# before it released us), exports it as QUANTUM_SESSION_ID, then execs the real
-# work.
+# quantum-wrap wraps the classical job. It reads the session id the scout put
+# on our eventlog, exports it as QUANTUM_SESSION_ID, then execs the real work.
 #
 #   quantum-wrap -- real-program [args...]
 #
-# No shared filesystem is involved: job-info.eventlog-watch is a FLUX_ROLE_USER
-# service authorized against the job's owner uid, so an unprivileged user can
-# read the eventlog of a job they own from whatever node they landed on.
-#
-# The scout posts the memo BEFORE the release RPC, so by the time this job is
-# unheld and starts, the memo is already in the replayed eventlog. The timeout
-# is only a guard against a scout that died between release and memo.
-##############################################################
+# The memo is posted before the release, so it is already there when we start.
+# The timeout only guards against a scout that died before memoing.
 import argparse
 import os
 import signal
@@ -28,11 +19,7 @@ class _Timeout(Exception):
 
 
 def read_session(handle, jobid, timeout=60.0, watcher=None):
-    """Return the session id posted on this job's eventlog by the scout.
-
-    `watcher` is injectable for testing; by default it is flux.job.event_watch,
-    a generator that replays the existing eventlog and then follows it.
-    """
+    """Return the session id the scout put on the eventlog for this job."""
     if watcher is None:
         from flux.job import event_watch as watcher
 
@@ -81,8 +68,8 @@ def main():
     if not cmd:
         print("quantum-wrap: QUANTUM_SESSION_ID={} (no command given)".format(session))
         return
-    # stderr so it shows in the job's output without interfering with the
-    # wrapped program's stdout; confirms the handoff reached this process.
+    # stderr so it shows in the job output without disturbing the stdout of
+    # the wrapped program, and confirms the handoff reached this process
     sys.stderr.write(
         "quantum-wrap: QUANTUM_SESSION_ID={} -> exec {}\n".format(
             session, " ".join(cmd)

@@ -26,14 +26,14 @@ def test_scout_jobspec_requests_core_and_qpu():
     js = launch.build_scout_jobspec("ibm", 123456789, ncores=1)
 
     res = js["resources"]
-    # classical: a node with a labeled slot holding a core
+    # classical, a node with a labeled slot holding a core
     node = _find(res, "node")
     assert node is not None, res
     assert _cores_under_node(node) == 1
     slot = _find(node["with"], "slot")
     assert slot["label"] == "scout"
 
-    # quantum: a SEPARATE top-level qdevice_<v> -> qpu (root-level device)
+    # quantum, a separate top level qdevice_<v> -> qpu
     qv = _find(res, "qdevice_ibm")
     assert qv is not None, res
     assert qv["with"][0]["type"] == "qpu"
