@@ -42,6 +42,24 @@ def read_session(handle, jobid, timeout=60.0, watcher=None):
     raise RuntimeError("job eventlog ended without a session memo")
 
 
+def session_environment(session, resources=None):
+    """Return the env the wrapped program should see.
+
+    QRMI reads the acquisition token from <resource>_QRMI_JOB_ACQUISITION_TOKEN,
+    the same variable the Slurm and LSF plugins set, so a workload written for
+    either runs here unchanged. The resource names arrive at submit time, the
+    token only exists once the scout has acquired.
+    """
+    if resources is None:
+        resources = os.environ.get("QRMI_JOB_QPU_RESOURCES", "")
+    env = {"QUANTUM_SESSION_ID": session}
+    for resource in resources.split(","):
+        resource = resource.strip()
+        if resource:
+            env[resource + "_QRMI_JOB_ACQUISITION_TOKEN"] = session
+    return env
+
+
 def main():
     ap = argparse.ArgumentParser(prog="quantum-wrap")
     ap.add_argument("--timeout", type=float, default=60.0)
@@ -60,7 +78,7 @@ def main():
     except Exception as e:
         sys.exit("quantum-wrap: {}".format(e))
 
-    os.environ["QUANTUM_SESSION_ID"] = session
+    os.environ.update(session_environment(session))
 
     cmd = args.command
     if cmd and cmd[0] == "--":

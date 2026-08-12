@@ -54,6 +54,7 @@ def prepare_pair(
     vendor,
     scout_cores=1,
     options=None,
+    job_env=None,
     submit_fn=None,
     populate_fn=None,
     get_graph_fn=None,
@@ -90,6 +91,8 @@ def prepare_pair(
     sysattr["hold"] = 1
     quantum = sysattr.setdefault("quantum", {})
     quantum["vendor"] = vendor
+    if job_env:
+        sysattr.setdefault("environment", {}).update(job_env)
 
     # if feasibility validation is on, an unsatisfiable request is rejected here
     # and we abort before spending any quantum quota
@@ -237,8 +240,11 @@ class QuantumCLIPlugin(CLIPlugin):
 
         backend = get_backend(vendor)
         options = backend.scout_options(args) if backend else {}
+        job_env = backend.job_environment(options) if backend else {}
         handle = flux.Flux()
-        main_id = prepare_pair(handle, jobspec, vendor, scout_cores=1, options=options)
+        main_id = prepare_pair(
+            handle, jobspec, vendor, scout_cores=1, options=options, job_env=job_env
+        )
         print(
             "flux quantum: held classical job {} (vendor={}); this submit "
             "launches its scout".format(main_id, vendor),

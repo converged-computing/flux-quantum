@@ -11,6 +11,10 @@ requires-python = ">=3.8"
 # flux-core releases. Developed/tested against flux-core 0.87.0. Pin to a
 # contemporaneous flux-core, per Flux packaging guidance.
 
+[project.optional-dependencies]
+# qrmi needs python 3.11 or newer, so it stays optional
+qrmi = ["qrmi[ibm]"]
+
 [project.urls]
 Homepage = "https://github.com/flux-framework"
 

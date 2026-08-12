@@ -89,7 +89,7 @@ jobs:
         run: |
           export FLUX_CLI_PLUGINPATH=$PWD/cli-plugins
           out=$(flux start flux submit --help 2>&1)
-          for opt in --quantum-ibm-backend --quantum-braket-device --quantum-mock-session; do
+          for opt in --quantum-ibm-resource --quantum-braket-device --quantum-mock-session; do
             echo "$out" | grep -q -- "$opt" || { echo "missing $opt"; exit 1; }
             echo "  $opt OK"
           done

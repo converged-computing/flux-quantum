@@ -1,3 +1,11 @@
+IBM_CREDS = {
+    "ibm_kingston_QRMI_IBM_QRS_ENDPOINT": "supersecret",
+    "ibm_kingston_QRMI_IBM_QRS_IAM_ENDPOINT": "supersecret",
+    "ibm_kingston_QRMI_IBM_QRS_IAM_APIKEY": "supersecret",
+    "ibm_kingston_QRMI_IBM_QRS_SERVICE_CRN": "supersecret",
+}
+
+
 def test_real_backends_registered(backends_real):
     assert backends_real.known_vendors() == {"ibm", "braket"}
 
@@ -17,13 +25,25 @@ def test_mock_present_with_env(backends_mock):
 
 def test_missing_creds_reported(backends_real):
     ok, msg = backends_real.get_backend("ibm").credentials_present()
-    assert not ok and "QISKIT_IBM_TOKEN" in msg
+    # names the variables it wants, never a value
+    assert not ok and "_QRMI_IBM_QRS_IAM_APIKEY" in msg
 
 
 def test_creds_present_when_env_set(fresh):
-    b = fresh(mock=False, env={"QISKIT_IBM_TOKEN": "x"})
+    b = fresh(mock=False, env=IBM_CREDS)
     ok, msg = b.get_backend("ibm").credentials_present()
-    assert ok
+    assert ok and "ibm_kingston" in msg
+
+
+def test_partial_creds_name_only_the_missing_variable(fresh):
+    partial = dict(IBM_CREDS)
+    del partial["ibm_kingston_QRMI_IBM_QRS_SERVICE_CRN"]
+    b = fresh(mock=False, env=partial)
+    ok, msg = b.get_backend("ibm").credentials_present()
+    assert not ok
+    assert "ibm_kingston_QRMI_IBM_QRS_SERVICE_CRN" in msg
+    # the api key value must never be echoed back
+    assert "supersecret" not in msg
 
 
 def test_mock_needs_no_creds(backends_mock):
@@ -39,15 +59,37 @@ def test_backend_declares_options_and_scout_options_roundtrip():
     ibm = get_backend("ibm")
     declared = []
     ibm.add_options(lambda name, **kw: declared.append(name))
-    assert "--ibm-backend" in declared and "--ibm-shots" in declared
+    assert "--ibm-resource" in declared and "--ibm-type" in declared
 
     class _Args:
-        ibm_backend = "ibm_brisbane"
-        ibm_instance = None
-        ibm_shots = "1024"
+        ibm_resource = "ibm_kingston"
+        ibm_type = None
 
     opts = ibm.scout_options(_Args())
-    assert opts["backend"] == "ibm_brisbane" and opts["shots"] == "1024"
+    assert opts["resource"] == "ibm_kingston"
+    assert opts["type"] == "qiskit-runtime-service"
+
+
+def test_scout_options_infer_the_resource_from_the_environment(fresh):
+    """One resource configured is unambiguous, so the id need not be repeated."""
+    b = fresh(mock=False, env=IBM_CREDS)
+
+    class _Args:
+        ibm_resource = None
+        ibm_type = None
+
+    assert b.get_backend("ibm").scout_options(_Args())["resource"] == "ibm_kingston"
+
+
+def test_job_environment_follows_the_qrmi_convention(fresh):
+    """The classical job gets the same variables Slurm and LSF set, so user
+    code can call get_job_qpu_resources_and_types unchanged."""
+    b = fresh(mock=False, env=IBM_CREDS)
+    env = b.get_backend("ibm").job_environment(
+        {"resource": "ibm_kingston", "type": "qiskit-runtime-service"}
+    )
+    assert env["QRMI_JOB_QPU_RESOURCES"] == "ibm_kingston"
+    assert env["QRMI_JOB_QPU_TYPES"] == "qiskit-runtime-service"
 
 
 def test_mock_open_session_uses_options(monkeypatch):
@@ -63,9 +105,20 @@ def test_mock_open_session_uses_options(monkeypatch):
     assert b.open_session({}).startswith("mock-session-")
 
 
-def test_ibm_open_session_deferred_is_explicit():
+def test_open_session_without_a_resource_is_explicit():
     from flux_quantum.backends import get_backend
     import flux_quantum.backends.ibm  # noqa
 
-    with __import__("pytest").raises(NotImplementedError):
-        get_backend("ibm").open_session({"backend": "x"})
+    with __import__("pytest").raises(ValueError, match="no QRMI resource id"):
+        get_backend("ibm").open_session({})
+
+
+def test_open_session_names_the_missing_variable(fresh):
+    partial = dict(IBM_CREDS)
+    del partial["ibm_kingston_QRMI_IBM_QRS_IAM_APIKEY"]
+    b = fresh(mock=False, env=partial)
+    with __import__("pytest").raises(ValueError) as e:
+        b.get_backend("ibm").open_session(
+            {"resource": "ibm_kingston", "type": "qiskit-runtime-service"}
+        )
+    assert "ibm_kingston_QRMI_IBM_QRS_IAM_APIKEY" in str(e.value)

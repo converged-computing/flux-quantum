@@ -57,6 +57,11 @@ class Backend(ABC):
             "{}: open_session is not implemented for this vendor".format(self.name)
         )
 
+    def job_environment(self, options):
+        """Env vars to add to the classical job, for example to tell it which
+        QPU it has. Defaults to none."""
+        return {}
+
     def close_session(self, session=None):
         """Release the session opened by open_session.
 

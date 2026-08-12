@@ -1,2 +1,7 @@
 dist
 *.egg-info
+
+# never commit filled in credentials
+.env
+*.env
+!env.example

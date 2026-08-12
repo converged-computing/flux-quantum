@@ -66,7 +66,7 @@ def test_plugin_registers_options_with_quantum_prefix(stub_flux_cli):
     # core options always present
     assert {"--vendor", "--select"} <= names
     # each registered vendor backend contributes its own namespaced options
-    assert "--ibm-backend" in names and "--braket-device" in names
+    assert "--ibm-resource" in names and "--braket-device" in names
 
 
 def test_plugin_inactive_for_other_progs(stub_flux_cli):
@@ -296,3 +296,25 @@ def test_unlimited_classical_keeps_scout_unlimited(stub_flux_cli):
         cancel_fn=lambda *a: None,
     )
     assert js.jobspec["attributes"]["system"]["duration"] == 0
+
+
+def test_job_env_reaches_the_classical(stub_flux_cli):
+    """A backend can add env to the classical job, which is how the QPU
+    assignment gets there."""
+    from flux_quantum import cli
+
+    js = _fake_jobspec(["myprog"])
+    submitted = {}
+
+    cli.prepare_pair(
+        handle=None,
+        jobspec=js,
+        vendor="mock",
+        job_env={"QRMI_JOB_QPU_RESOURCES": "ibm_kingston"},
+        submit_fn=lambda h, j: submitted.setdefault("js", json.loads(j)) and 0 or 7,
+        populate_fn=lambda h, v: None,
+        get_graph_fn=lambda h: _live_graph(),
+        cancel_fn=lambda *a: None,
+    )
+    env = submitted["js"]["attributes"]["system"]["environment"]
+    assert env["QRMI_JOB_QPU_RESOURCES"] == "ibm_kingston"

@@ -1,3 +1,11 @@
+IBM_CREDS = {
+    "ibm_kingston_QRMI_IBM_QRS_ENDPOINT": "x",
+    "ibm_kingston_QRMI_IBM_QRS_IAM_ENDPOINT": "x",
+    "ibm_kingston_QRMI_IBM_QRS_IAM_APIKEY": "x",
+    "ibm_kingston_QRMI_IBM_QRS_SERVICE_CRN": "x",
+}
+
+
 import importlib
 import pytest
 
@@ -11,14 +19,33 @@ def test_no_usable_vendor_raises(backends_real):
     with pytest.raises(sel.SelectionError) as e:
         sel.select_vendor()
     # error lists the missing creds for each vendor
-    assert "QISKIT_IBM_TOKEN" in str(e.value)
+    assert "_QRMI_IBM_QRS_IAM_APIKEY" in str(e.value)
 
 
-def test_select_ibm_with_token(fresh):
-    fresh(mock=False, env={"QISKIT_IBM_TOKEN": "x"})
+def test_select_ibm_when_reachable(fresh, monkeypatch):
+    """Credentials alone are not enough. The probe asks QRMI whether the
+    resource is reachable, so stub that rather than calling out to IBM."""
+    b = fresh(mock=False, env=IBM_CREDS)
+    from flux_quantum.backends.base import Signals
+
+    monkeypatch.setattr(
+        b.get_backend("ibm").__class__, "probe", lambda self: Signals(available=True)
+    )
     sel = _selector()
     vendor, sig, log = sel.select_vendor(policy="any")
     assert vendor == "ibm"
+
+
+def test_unreachable_ibm_is_not_a_candidate(fresh, monkeypatch):
+    b = fresh(mock=False, env=IBM_CREDS)
+    from flux_quantum.backends.base import Signals
+
+    monkeypatch.setattr(
+        b.get_backend("ibm").__class__, "probe", lambda self: Signals(available=False)
+    )
+    sel = _selector()
+    with pytest.raises(sel.SelectionError):
+        sel.select_vendor(policy="any")
 
 
 def test_explicit_braket_without_creds_raises(backends_real):
