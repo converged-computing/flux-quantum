@@ -15,12 +15,16 @@ the scout. qiskit comes along with it and we need that for the warmup task.
 
 QRMI reads its config out of the environment. Every variable is prefixed with the
 resource id, so for ibm_kingston the api key lives in
-`ibm_kingston_QRMI_IBM_QRS_IAM_APIKEY`. Four of them are required.
+`ibm_kingston_QRMI_IBM_QRS_IAM_APIKEY`. Four of them are required. Note that this used to work for me, and it stopped. I now login with the web interface copy paste, which looks like this:
 
-    cp env.example .env
-    chmod 600 .env
-    $EDITOR .env
-    set -a && . ./.env && set +a
+```bash
+ibmcloud login -a https://cloud.ibm.com -u passcode -p <pass>
+```
+```bash
+export IBM_CLOUD_TOKEN=<key>
+ibmcloud login --apikey $IBM_CLOUD_TOKEN
+export IBM_CLOUD_CRN=$(ibmcloud resource service-instances --service-name quantum-computing --output json | jq -r '.[] | {name: .name, crn: .crn}' | jq -r .crn)
+```
 
 Check before you submit anything.
 
@@ -29,6 +33,17 @@ Check before you submit anything.
     print(get_backend('ibm').credentials_present())"
 
 That names any variable you are missing. It never prints a value.
+
+
+unset FLUX_QUANTUM_MOCK
+flux submit -t 30m \
+  --quantum-vendor ibm --quantum-ibm-resource <your_backend> \
+  --quantum-ibm-warmup-timeout 600 \
+  -n4 flux python /opt/flux-quantum/examples/qrmi/workload.py
+
+flux jobs -a
+flux job attach <scout-id>              # this is where a Premium refusal shows up
+flux job eventlog <classical-id> | grep memo
 
 ## Submit
 
@@ -45,32 +60,15 @@ resource has credentials in the environment you can drop
 
 ## You need an account that can open sessions
 
-This is the thing that will bite you first. The qiskit-runtime-service type opens
-a session, and IBM only allows that on plans that support sessions, like Premium.
-On Open or Pay As You Go you can submit tasks but you cannot hold a session, so
-there is nothing for the scout to co-allocate.
-
-You get told that in those words rather than a 403. The held classical job is
-cancelled, so nothing is left sitting in the queue.
-
-If you have direct access instead, use `--quantum-ibm-type ibm-quantum-system`.
+The qiskit-runtime-service type opens a session, and IBM only allows that on plans that support sessions (Premium). On Open or Pay As You Go you can submit tasks but you cannot hold a session. You will get an error message (403). Our library will cancel the held classical job. If you have direct access instead, use `--quantum-ibm-type ibm-quantum-system`.
 
 ## A session is not the same as having the QPU
 
 An IBM session goes active when its first task reaches the head of the queue.
 After that, tasks in the session keep that priority. So opening a session tells
-you very little on its own.
-
-After acquiring, the scout submits a warmup task, one qubit measured once, and
-waits for it to leave the queue. Once that task is running we are at the head,
-the session is live, and only then do we release the classical job.
-
-That is the whole point. The classical job sits held with its nodes reserved
-while the scout waits in the QPU queue. It starts the moment the QPU is really
-ours, so neither side pays to wait for the other.
-
-If the warmup never runs we release the session and fail the submit. The
-classical job never starts against a QPU we do not have.
+you very little on its own. After acquire we have to submit a warmup task and monitor it,
+and it is small (one qubit and one measurement) and wait for it to run. Then we can at least
+say that we reached the top and have priority and we release classical. If the warmup never runs we release the session and fail the submit. The classical job never starts against a QPU we do not have.
 
     --quantum-ibm-warmup-timeout SECONDS   give up after this long. Default 0,
                                            which means wait as long as the
@@ -84,26 +82,17 @@ The warmup costs one shot.
 
 ## The scout holds the session for as long as the classical runs
 
-That is deliberate. The fluxion allocation and the vendor session start and end
+The fluxion allocation and the vendor session start and end
 together. It does mean you are billed for the length of the classical job and not
 the length of the quantum work, so set `-t`.
 
 A killed scout still releases, the release is in a finally and SIGTERM is
 handled. If the node dies you are down to the vendor timeout.
 
-## Credentials, and where they end up
+## Credentials
 
 The plugin runs in your process at submit time and reads the variables out of
-your environment. The scout uses them, and it runs as you.
-
-Flux copies the submitting environment into the jobspec, so they are in the job
-record and the instance owner can read them. Same as any other job environment.
-What does not happen is a credential owned by the system user, or one shared
-between users. If that is not good enough for you, do not export the key in the
-shell you submit from.
-
-Only the session id travels to the classical job, and it goes over the job
-eventlog.
+your environment. The scout uses them, and it runs as you. Only the session id travels to the classical job, and it goes over the job eventlog.
 
 ## What the classical job sees
 
