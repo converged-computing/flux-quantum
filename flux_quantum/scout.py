@@ -38,6 +38,26 @@ def wait_for_job(handle, jobid, waiter=None):
     waiter(handle, jobid, "clean", raiseJobException=False)
 
 
+def abort_held(handle, jobid, why, cancel=None):
+    """Cancel the held classical and exit.
+
+    Anything that fails before the release leaves the job held with its
+    reservation and nothing on the way to free it, so cancel it rather than
+    leave nodes parked on work that will never start.
+    """
+    if cancel is None:
+        from flux.job import cancel
+    try:
+        cancel(handle, jobid, why)
+        print("quantum-scout: cancelled held job {}".format(jobid), file=sys.stderr)
+    except Exception as e:
+        print(
+            "quantum-scout: WARNING could not cancel held job {}: {}".format(jobid, e),
+            file=sys.stderr,
+        )
+    sys.exit("quantum-scout: {}".format(why))
+
+
 def _install_signal_handlers():
     """Unwind on SIGTERM/SIGINT so the session still gets closed."""
 
@@ -79,6 +99,7 @@ def main():
     from flux.job import JobID
 
     jobid = int(JobID(args.job))
+    h = flux.Flux()
 
     # --session bypasses the backend for testing
     backend = None
@@ -93,23 +114,15 @@ def main():
             )
         try:
             session = backend.open_session(json.loads(args.options))
-        except NotImplementedError as e:
-            sys.exit("quantum-scout: {}".format(e))
         except Exception as e:
-            sys.exit(
-                "quantum-scout: opening {} session failed: {}".format(args.vendor, e)
-            )
-
-    h = flux.Flux()
+            abort_held(h, jobid, "opening {} session failed: {}".format(args.vendor, e))
 
     # must land before the release, or the job could start with no session
     try:
         post_session(h, jobid, session)
     except Exception as e:
-        sys.exit(
-            "quantum-scout: could not post the session to job {}: {}".format(
-                args.job, e
-            )
+        abort_held(
+            h, jobid, "could not post the session to job {}: {}".format(args.job, e)
         )
 
     _install_signal_handlers()

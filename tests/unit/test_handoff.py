@@ -145,3 +145,30 @@ def test_signal_handlers_unwind_so_the_session_is_closed():
         assert closed == ["closed"]
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+def test_abort_cancels_the_held_job():
+    """A failure before the release must not leave the classical held forever."""
+    from flux_quantum.scout import abort_held
+
+    cancelled = {}
+
+    def fake_cancel(handle, jobid, why):
+        cancelled["jobid"] = jobid
+        cancelled["why"] = why
+
+    with pytest.raises(SystemExit):
+        abort_held(None, 4021041664, "opening ibm session failed", cancel=fake_cancel)
+    assert cancelled["jobid"] == 4021041664
+    assert "opening ibm session failed" in cancelled["why"]
+
+
+def test_abort_still_exits_when_the_cancel_fails():
+    """A broker we cannot reach must not turn into a hang."""
+    from flux_quantum.scout import abort_held
+
+    def boom(handle, jobid, why):
+        raise RuntimeError("no broker")
+
+    with pytest.raises(SystemExit):
+        abort_held(None, 1, "whatever", cancel=boom)
