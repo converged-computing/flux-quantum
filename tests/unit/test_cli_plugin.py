@@ -318,3 +318,32 @@ def test_job_env_reaches_the_classical(stub_flux_cli):
     )
     env = submitted["js"]["attributes"]["system"]["environment"]
     assert env["QRMI_JOB_QPU_RESOURCES"] == "ibm_kingston"
+
+
+def test_classical_carries_its_core_count(stub_flux_cli):
+    """The jobtap plugin budgets on this, and only the classical carries it so
+    the scout is not counted twice."""
+    from flux_quantum import cli
+
+    js = _fake_jobspec(["myprog"])
+    js.jobspec["resources"] = [
+        {"type": "slot", "count": 4, "with": [{"type": "core", "count": 1}]}
+    ]
+    submitted = {}
+
+    cli.prepare_pair(
+        handle=None,
+        jobspec=js,
+        vendor="mock",
+        submit_fn=lambda h, j: submitted.setdefault("js", json.loads(j)) and 0 or 7,
+        populate_fn=lambda h, v: None,
+        get_graph_fn=lambda h: _live_graph(),
+        cancel_fn=lambda *a: None,
+    )
+    quantum = submitted["js"]["attributes"]["system"]["quantum"]
+    assert quantum["cores"] == 4
+    assert quantum["vendor"] == "mock"
+
+    # what flux submits is the scout, and it carries no quantum attributes
+    scout_sys = js.jobspec["attributes"]["system"]
+    assert "quantum" not in scout_sys or "cores" not in scout_sys.get("quantum", {})

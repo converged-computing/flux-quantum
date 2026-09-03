@@ -144,3 +144,26 @@ def classical_resource(live_graph, ncores=1, label="scout"):
     for t in reversed(intermediates):
         inner = {"type": t, "count": 1, "with": [inner]}
     return {"type": "node", "count": 1, "with": [inner]}
+
+
+def count_cores(jobspec):
+    """Total cores a v1 jobspec asks for.
+
+    Multiplies counts down the resource tree and sums the core leaves. The
+    jobtap plugin needs this to keep a core budget, and doing it here means it
+    is testable without a broker rather than parsed in C.
+    """
+
+    def walk(entries, factor):
+        total = 0
+        for entry in entries or []:
+            count = entry.get("count", 1)
+            if isinstance(count, dict):  # a range, take the minimum we must get
+                count = count.get("min", 1)
+            n = factor * int(count)
+            if entry.get("type") == "core":
+                total += n
+            total += walk(entry.get("with"), n)
+        return total
+
+    return walk(jobspec.get("resources"), 1)

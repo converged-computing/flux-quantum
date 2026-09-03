@@ -21,7 +21,7 @@ import sys
 import flux
 from flux.cli.plugin import CLIPlugin
 
-from . import graph
+from . import graph, qresource
 from .selector import select_vendor, SelectionError, discover_registry_vendors
 from .backends import get_backend, backend_classes
 from .launch import build_scout_jobspec
@@ -91,6 +91,10 @@ def prepare_pair(
     sysattr["hold"] = 1
     quantum = sysattr.setdefault("quantum", {})
     quantum["vendor"] = vendor
+    # the jobtap plugin keeps a core budget over every unfinished pair, and it
+    # needs the classical size to do that. Counting here rather than walking the
+    # jobspec in C.
+    quantum["cores"] = qresource.count_cores(classical)
     if job_env:
         sysattr.setdefault("environment", {}).update(job_env)
 
