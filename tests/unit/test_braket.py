@@ -101,7 +101,7 @@ def test_region_comes_from_the_device_arn(monkeypatch):
 def test_ready_at_queue_position_one(fake_braket):
     b = _backend()
     b._task = FakeTask(states=["QUEUED", "QUEUED"], positions=["3", "1"])
-    ok, why = b.wait_for_priority(interval=0, sleep=lambda s: None)
+    ok, why = b.wait_for_priority({}, interval=0, sleep=lambda s: None)
     assert ok and "position 1" in why
 
 
@@ -109,7 +109,7 @@ def test_ready_when_the_task_already_left_the_queue(fake_braket):
     """A task that is RUNNING reports no position, so waiting for 1 would hang."""
     b = _backend()
     b._task = FakeTask(states=["RUNNING"], positions=[None])
-    ok, why = b.wait_for_priority(interval=0, sleep=lambda s: None)
+    ok, why = b.wait_for_priority({}, interval=0, sleep=lambda s: None)
     assert ok and why == "RUNNING"
 
 
@@ -117,7 +117,7 @@ def test_completed_is_also_ready(fake_braket):
     """On SV1 a trivial task can finish before we ever observe position 1."""
     b = _backend()
     b._task = FakeTask(states=["COMPLETED"], positions=[None])
-    ok, why = b.wait_for_priority(interval=0, sleep=lambda s: None)
+    ok, why = b.wait_for_priority({}, interval=0, sleep=lambda s: None)
     assert ok and why == "COMPLETED"
 
 
@@ -125,14 +125,14 @@ def test_failed_is_not_ready(fake_braket):
     """The classical must be cancelled, not started against a task with no result."""
     b = _backend()
     b._task = FakeTask(states=["FAILED"], positions=[None])
-    ok, why = b.wait_for_priority(interval=0, sleep=lambda s: None)
+    ok, why = b.wait_for_priority({}, interval=0, sleep=lambda s: None)
     assert not ok and why == "FAILED"
 
 
 def test_cancelled_is_not_ready(fake_braket):
     b = _backend()
     b._task = FakeTask(states=["CANCELLED"], positions=[None])
-    ok, why = b.wait_for_priority(interval=0, sleep=lambda s: None)
+    ok, why = b.wait_for_priority({}, interval=0, sleep=lambda s: None)
     assert not ok
 
 
@@ -140,14 +140,16 @@ def test_deep_queue_position_is_compared_as_a_string(fake_braket):
     """Braket reports anything over 2000 as the string >2000."""
     b = _backend()
     b._task = FakeTask(states=["QUEUED", "QUEUED"], positions=[">2000", "1"])
-    ok, why = b.wait_for_priority(interval=0, sleep=lambda s: None)
+    ok, why = b.wait_for_priority({}, interval=0, sleep=lambda s: None)
     assert ok
 
 
 def test_timeout_reports_the_position(fake_braket):
     b = _backend()
     b._task = FakeTask(states=["QUEUED"] * 5, positions=["7"] * 5)
-    ok, why = b.wait_for_priority(timeout=1, interval=1, sleep=lambda s: None)
+    ok, why = b.wait_for_priority(
+        {"queue_timeout": 1}, interval=1, sleep=lambda s: None
+    )
     assert not ok and "still queued at position 7" in why
 
 
@@ -163,11 +165,13 @@ def test_open_session_submits_a_one_qubit_no_op(fake_braket):
     assert fake_braket["shots"] == 1
 
 
-def test_open_session_raises_when_the_task_fails(fake_braket):
-    """So the scout cancels the held classical instead of releasing it."""
+def test_failed_task_is_reported_not_raised(fake_braket):
+    """The scout cancels the held classical on a False from here."""
     fake_braket["task"] = FakeTask(states=["FAILED"], positions=[None])
-    with pytest.raises(RuntimeError, match="never reached the front of the queue"):
-        _backend().open_session({"queue_timeout": 0})
+    b = _backend()
+    b.open_session({"queue_timeout": 0})
+    ok, why = b.wait_for_priority({}, interval=0, sleep=lambda s: None)
+    assert not ok and why == "FAILED"
 
 
 def test_close_session_is_a_no_op(fake_braket):

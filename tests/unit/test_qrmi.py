@@ -245,8 +245,8 @@ def test_warmup_waits_until_the_task_leaves_the_queue(fake_qrmi, monkeypatch):
     )
     b = _acquired(fake_qrmi, ["Queued", "Queued", "Running"])
     slept = []
-    ok, task, reason = b.wait_for_priority(interval=1, sleep=slept.append)
-    assert ok and reason == "Running"
+    ok, reason = b.wait_for_priority({}, interval=1, sleep=slept.append)
+    assert ok and "Running" in reason
     assert len(slept) == 2
 
 
@@ -255,8 +255,8 @@ def test_warmup_failure_means_no_priority(fake_qrmi, monkeypatch):
         "flux_quantum.backends.qrmi.warmup_payload", lambda shots=1: {"pubs": []}
     )
     b = _acquired(fake_qrmi, ["Queued", "Failed"])
-    ok, task, reason = b.wait_for_priority(interval=0, sleep=lambda s: None)
-    assert not ok and reason == "Failed"
+    ok, reason = b.wait_for_priority({}, interval=0, sleep=lambda s: None)
+    assert not ok and "Failed" in reason
 
 
 def test_warmup_timeout_stops_the_task(fake_qrmi, monkeypatch):
@@ -264,30 +264,27 @@ def test_warmup_timeout_stops_the_task(fake_qrmi, monkeypatch):
         "flux_quantum.backends.qrmi.warmup_payload", lambda shots=1: {"pubs": []}
     )
     b = _acquired(fake_qrmi, ["Queued"] * 10)
-    ok, task, reason = b.wait_for_priority(timeout=1, interval=1, sleep=lambda s: None)
+    ok, reason = b.wait_for_priority(
+        {"warmup_timeout": 1}, interval=1, sleep=lambda s: None
+    )
     assert not ok and "still queued" in reason
     assert ("task_stop", "TASK-1") in fake_qrmi.calls
 
 
-def test_session_released_when_priority_is_never_reached(fake_qrmi, monkeypatch):
-    """Never release the classical job against a session we do not own."""
+def test_priority_not_reached_is_reported(fake_qrmi, monkeypatch):
+    """The scout cancels the held job on a False here, so never say ok."""
     monkeypatch.setattr(
         "flux_quantum.backends.qrmi.warmup_payload", lambda shots=1: {"pubs": []}
     )
-    fake_qrmi.statuses = ["Failed"]
-    b = _ibm()
-    with pytest.raises(RuntimeError, match="do not have priority"):
-        b.open_session(_opts(ready_timeout=0))
-    assert ("release", RESOURCE, "LOCK-123") in fake_qrmi.calls
+    b = _acquired(fake_qrmi, ["Failed"])
+    ok, reason = b.wait_for_priority({}, interval=0, sleep=lambda s: None)
+    assert not ok and "Failed" in reason
 
 
-def test_skip_warmup_releases_immediately(fake_qrmi, monkeypatch):
-    monkeypatch.setattr(
-        "flux_quantum.backends.qrmi.warmup_payload", lambda shots=1: {"pubs": []}
-    )
-    fake_qrmi.statuses = []
-    b = _ibm()
-    assert b.open_session(_opts(ready_timeout=0, skip_warmup=True)) == "LOCK-123"
+def test_skip_warmup_submits_nothing(fake_qrmi):
+    b = _acquired(fake_qrmi, [])
+    ok, reason = b.wait_for_priority({"skip_warmup": True})
+    assert ok and "skipped" in reason
     assert not any(c[0] == "task_start" for c in fake_qrmi.calls)
 
 
@@ -313,9 +310,9 @@ def test_missing_qiskit_says_what_to_install(fake_qrmi, monkeypatch):
             raise ImportError("no qiskit")
         return real(name, *a, **k)
 
+    b = _acquired(fake_qrmi, ["Queued"])
     monkeypatch.setattr(builtins, "__import__", no_qiskit)
-    b = _ibm()
     with pytest.raises(RuntimeError) as e:
-        b.open_session(_opts(ready_timeout=0))
+        b.wait_for_priority({})
     assert "qrmi[ibm]" in str(e.value)
     assert "skip-warmup" in str(e.value)

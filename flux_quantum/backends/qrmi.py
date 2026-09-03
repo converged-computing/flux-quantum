@@ -108,7 +108,8 @@ def warmup_payload(shots=1):
     except ImportError:
         raise RuntimeError(
             "qiskit is needed to build the warmup task. Install it with "
-            "pip install 'qrmi[ibm]', or skip the priority check"
+            "pip install 'qrmi[ibm]', or pass --quantum-ibm-skip-warmup to "
+            "release without confirming priority"
         )
 
     qc = QuantumCircuit(1, 1)
@@ -280,28 +281,6 @@ class QRMIBackend(Backend):
                 )
             )
 
-        # Reaching the head of the queue is what gives us priority, so wait for
-        # it before letting the classical job start.
-        if not options.get("skip_warmup"):
-            try:
-                ok, task, reason = self.wait_for_priority(
-                    timeout=float(options.get("warmup_timeout") or 0)
-                )
-            except Exception as e:
-                self.close_session()
-                raise RuntimeError(
-                    "{}: session opened on {} but the warmup task could not "
-                    "run, so priority is unconfirmed: {}\n  pass "
-                    "--quantum-{}-skip-warmup to release without this "
-                    "check".format(self.name, resource, e, self.name)
-                )
-            if not ok:
-                self.close_session()
-                raise RuntimeError(
-                    "{}: session opened on {} but the warmup task never "
-                    "reached the head of the queue ({}), so we do not have "
-                    "priority".format(self.name, resource, reason)
-                )
         return str(self._lock)
 
     def wait_until_ready(self, timeout=0.0, interval=5.0, sleep=time.sleep):
@@ -329,7 +308,7 @@ class QRMIBackend(Backend):
                 return False, last
             sleep(interval)
 
-    def wait_for_priority(self, timeout=0.0, interval=5.0, sleep=time.sleep, shots=1):
+    def wait_for_priority(self, options=None, interval=5.0, sleep=time.sleep, shots=1):
         """Submit a one shot task and wait for it to leave the queue.
 
         An IBM session activates when its first task reaches the head of the
@@ -338,11 +317,15 @@ class QRMIBackend(Backend):
         This is the only check available that means priority rather than just
         reachability.
 
-        Returns (ok, task_id, reason). timeout of 0 waits as long as the scout
-        job is allowed to live.
+        Returns (ok, reason). A timeout of 0 waits as long as the scout job is
+        allowed to live.
         """
         from qrmi import Payload, TaskStatus
 
+        options = options or {}
+        if options.get("skip_warmup"):
+            return True, "warmup skipped, priority unconfirmed"
+        timeout = float(options.get("warmup_timeout") or 0)
         payload = Payload.QiskitPrimitive(
             input=json.dumps(warmup_payload(shots)), program_id="sampler"
         )
@@ -351,15 +334,15 @@ class QRMIBackend(Backend):
         while True:
             status = self._resource.task_status(task)
             if status in (TaskStatus.Running, TaskStatus.Completed):
-                return True, task, str(status)
+                return True, "warmup task {} is {}".format(task, status)
             if status in (TaskStatus.Failed, TaskStatus.Cancelled):
-                return False, task, str(status)
+                return False, "warmup task {} is {}".format(task, status)
             if deadline is not None and time.time() + interval >= deadline:
                 try:
                     self._resource.task_stop(task)
                 except Exception:
                     pass
-                return False, task, "still queued after {}s".format(timeout)
+                return False, "still queued after {}s".format(timeout)
             sleep(interval)
 
     def close_session(self, session=None):

@@ -62,6 +62,19 @@ class Backend(ABC):
         QPU it has. Defaults to none."""
         return {}
 
+    def wait_for_priority(self, options=None):
+        """Block until the vendor is actually ours, then return (ok, reason).
+
+        Opening a session is not the same as having the device. IBM activates a
+        session when its first task reaches the head of the queue, and Braket
+        reports a queue position and never holds anything. So this is a separate
+        step from open_session, and the scout does not release the classical job
+        until it returns ok.
+
+        Defaults to ready, for vendors with no queue to wait on.
+        """
+        return True, "not applicable"
+
     def close_session(self, session=None):
         """Release the session opened by open_session.
 

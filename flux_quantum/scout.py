@@ -112,10 +112,25 @@ def main():
                 "quantum-scout: no backend registered for vendor {}, "
                 "set FLUX_QUANTUM_MOCK for the mock vendor".format(args.vendor)
             )
+        opts = json.loads(args.options)
         try:
-            session = backend.open_session(json.loads(args.options))
+            session = backend.open_session(opts)
         except Exception as e:
             abort_held(h, jobid, "opening {} session failed: {}".format(args.vendor, e))
+
+        # opening is not the same as having the device, so wait until it is ours
+        # before letting the classical job start
+        try:
+            ok, why = backend.wait_for_priority(opts)
+        except Exception as e:
+            backend.close_session(session)
+            abort_held(
+                h, jobid, "waiting for {} priority failed: {}".format(args.vendor, e)
+            )
+        if not ok:
+            backend.close_session(session)
+            abort_held(h, jobid, "{} never became ours: {}".format(args.vendor, why))
+        print("quantum-scout: {}".format(why))
 
     # must land before the release, or the job could start with no session
     try:

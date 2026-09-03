@@ -29,6 +29,18 @@ RAN = ("RUNNING", "COMPLETED")
 FAILED = ("FAILED", "CANCELLED")
 
 
+def position_at_most(pos, threshold):
+    """True when the queue position is at or under threshold.
+
+    Braket reports anything over 2000 as the string >2000, so a position that
+    is not a number counts as far away.
+    """
+    try:
+        return int(pos) <= int(threshold)
+    except (TypeError, ValueError):
+        return False
+
+
 def region_for(device_arn, override=None):
     """Region to talk to. Devices are not all in one, and a QPU searched in the
     wrong region simply never appears."""
@@ -71,6 +83,14 @@ class BraketBackend(Backend):
             help="Braket: shots for the queue probe task, default 1",
         )
         add_option(
+            "--braket-ungate-position",
+            metavar="N",
+            default=None,
+            help="Braket: release the classical job once the probe task is at "
+            "this queue position or closer. Default 1, next in line. Raise it "
+            "when the classical job is slow to start",
+        )
+        add_option(
             "--braket-queue-timeout",
             metavar="SECONDS",
             default=None,
@@ -87,6 +107,10 @@ class BraketBackend(Backend):
             "region": region_for(device, getattr(args, "braket_region", None)),
             "shots": 1 if shots is None else int(shots),
             "queue_timeout": 0 if timeout is None else float(timeout),
+            "ungate_position": int(
+                getattr(args, "braket_ungate_position", None)
+                or os.environ.get("QUANTUM_BRAKET_UNGATE_POSITION", 1)
+            ),
         }
 
     def job_environment(self, options):
@@ -98,10 +122,8 @@ class BraketBackend(Backend):
         }
 
     def open_session(self, options):
-        """Submit the probe task and wait for it to reach the front of the queue.
-
-        Returns the task ARN, which is what the classical job is handed.
-        """
+        """Submit the probe task and return its ARN, which is what the
+        classical job is handed. The scout calls wait_for_priority next."""
         from braket.aws import AwsDevice
         from braket.circuits import Circuit
 
@@ -113,29 +135,22 @@ class BraketBackend(Backend):
         # identity on one qubit. Braket measures every qubit, so this is the
         # smallest thing that still occupies the device.
         self._task = device.run(Circuit().i(0), shots=int(options.get("shots") or 1))
-        arn = self._task.id
+        return self._task.id
 
-        ok, reason = self.wait_for_priority(
-            timeout=float(options.get("queue_timeout") or 0)
-        )
-        if not ok:
-            raise RuntimeError(
-                "braket: probe task {} never reached the front of the queue "
-                "({})".format(arn, reason)
-            )
-        return arn
-
-    def wait_for_priority(self, timeout=0.0, interval=5.0, sleep=time.sleep):
+    def wait_for_priority(self, options=None, interval=5.0, sleep=time.sleep):
         """Poll until the probe task is next in line.
 
-        Ready at position 1, and also once the task is RUNNING or COMPLETED,
-        because a task that has left the queue reports no position and the
-        value we are waiting for can never arrive. FAILED and CANCELLED are not
-        ready, they are a failure, so the caller can cancel the classical job
-        rather than start it against nothing.
+        Ready at the requested position or closer, and also once the task is
+        RUNNING or COMPLETED, because a task that left the queue reports no
+        position and the value we wait for can never arrive. FAILED and
+        CANCELLED are a failure and not readiness, so the caller can cancel the
+        classical job rather than start it against nothing.
 
         Returns (ok, reason).
         """
+        options = options or {}
+        timeout = float(options.get("queue_timeout") or 0)
+        position = int(options.get("ungate_position") or 1)
         deadline = time.time() + timeout if timeout > 0 else None
         while True:
             state = self._task.state()
@@ -146,8 +161,8 @@ class BraketBackend(Backend):
             pos = self.queue_position()
             # positions over 2000 come back as the string >2000, so compare as
             # a string rather than an int
-            if str(pos) == "1":
-                return True, "queue position 1"
+            if position_at_most(pos, position):
+                return True, "queue position {}".format(pos)
             print("braket: queued at position {}".format(pos), flush=True)
             if deadline is not None and time.time() + interval >= deadline:
                 return False, "still queued at position {} after {}s".format(
