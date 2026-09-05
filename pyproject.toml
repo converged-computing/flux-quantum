@@ -11,6 +11,11 @@ requires-python = ">=3.8"
 # flux-core releases. Developed/tested against flux-core 0.87.0. Pin to a
 # contemporaneous flux-core, per Flux packaging guidance.
 
+[project.scripts]
+# populate the graph once at startup. Growing it while jobs hold resources
+# corrupts fluxion, so this must run before any job does.
+flux-quantum-populate = "flux_quantum.populate:main"
+
 [project.optional-dependencies]
 # qrmi needs python 3.11 or newer, so it stays optional
 qrmi = ["qrmi[ibm]"]

@@ -8,10 +8,14 @@
 # Needs at least 3 cores, so the pair has somewhere to go once room is made.
 
 set -u
-export FLUX_QUANTUM_MOCK=1
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 export FLUX_CLI_PLUGINPATH="$HERE/cli-plugins"
 rc=0
+
+if [ -z "${FLUX_QUANTUM_MOCK:-}" ]; then
+    echo "FAIL FLUX_QUANTUM_MOCK must be exported before flux start"
+    exit 1
+fi
 
 CORES=$(flux resource list -no "{ncores}" 2>/dev/null | head -1)
 CORES=${CORES:-0}
@@ -22,6 +26,12 @@ if [ "$CORES" -lt 3 ]; then
 fi
 
 make -s -C "$HERE/flux_quantum/jobtap" || { echo "FAIL build"; exit 1; }
+
+# Add the vendor to the graph before anything is allocated. Growing the graph
+# while jobs hold resources corrupts fluxion, every later free fails, and the
+# instance stops scheduling entirely.
+flux python -m flux_quantum.populate mock >/dev/null 2>&1 \
+    || echo "WARNING could not populate the graph up front"
 flux jobtap load "$HERE/flux_quantum/jobtap/quantum.so" \
     vendors="mock" total_cores="$CORES" reserve_cores=0 \
     protect_types="qpu" preempt_after=3 || { echo "FAIL load"; exit 1; }
@@ -30,7 +40,7 @@ echo ""
 echo "=== fill every core with unprotected work ==="
 fill=""
 for _ in $(seq 1 "$CORES"); do
-    id=$(flux submit --quiet -n1 sleep 600) && fill="$fill $id"
+    id=$(flux submit -n1 sleep 600) && fill="$fill $id"
 done
 sleep 3
 echo "  submitted $CORES one core jobs"
@@ -87,7 +97,7 @@ done
 # shellcheck disable=SC2086
 for id in $fill; do flux cancel "$id" 2>/dev/null; done
 flux cancel "$scout" 2>/dev/null
-flux jobtap remove quantum 2>/dev/null
+flux jobtap remove quantum.so 2>/dev/null
 
 echo ""
 echo "=== preemption test rc=$rc ==="

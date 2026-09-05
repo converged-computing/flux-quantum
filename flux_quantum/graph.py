@@ -52,10 +52,27 @@ def vendors_present(graph):
     return out
 
 
-def populate(handle, vendors, qpus=1, graph=None):
+def allocated_cores(handle, lister=None):
+    """Cores the scheduler currently has allocated."""
+    if lister is None:
+        from flux.resource import resource_list as lister
+    return int(lister(handle).get().allocated.ncores)
+
+
+def populate(handle, vendors, qpus=1, graph=None, lister=None, force=False):
     """Ensure qdevice_<vendor> -> qpu exists in the live graph.
 
     Idempotent, only missing vendors are added. Returns what was added.
+
+    Growing the graph while jobs hold resources corrupts fluxion. The spans of
+    the running jobs no longer match the graph, so every later free fails with
+    planner_multi_rem_span returned -1, those resources are never released, and
+    the instance stops scheduling anything at all. It looks like free cores that
+    nothing will use.
+
+    So refuse to grow a busy graph. Populate at startup instead, before any
+    jobs run, which is what the vendors are there for anyway. force=True is for
+    a caller that knows the instance is idle.
     """
     if isinstance(vendors, str):
         vendors = [vendors]
@@ -64,6 +81,20 @@ def populate(handle, vendors, qpus=1, graph=None):
     missing = [v for v in vendors if v not in vendors_present(graph)]
     if not missing:
         return set()
+
+    if not force:
+        try:
+            busy = allocated_cores(handle, lister)
+        except Exception:
+            busy = 0  # cannot tell, so do not block the caller
+        if busy:
+            raise RuntimeError(
+                "quantum: {} would have to be added to the fluxion graph, but "
+                "{} cores are allocated. Growing the graph now would break "
+                "resource release for every running job and wedge the "
+                "scheduler. Populate at startup instead, with "
+                "flux python -m flux_quantum.populate".format(", ".join(missing), busy)
+            )
     subgraph = qresource.graph_subgraph(graph, missing, qpus=qpus)
     try:
         handle.rpc(

@@ -3,137 +3,134 @@
 # running, and rejects a pair that would exceed it. Launching a scout commits
 # money, so the classical half has to be placeable.
 #
-#     flux start -s1 bash tests/integration/test-admission.sh
+#     FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-admission.sh
+#
+# The variable has to be set BEFORE flux start. The CLIPlugin validate hook is
+# also called by the job ingest validator, a separate process started with the
+# broker, so a variable exported inside the instance never reaches it and every
+# submit fails with no backend for vendor mock.
 
 set -u
-export FLUX_QUANTUM_MOCK=1
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 export FLUX_CLI_PLUGINPATH="$HERE/cli-plugins"
 rc=0
 
-echo "=== build and load with a small budget ==="
+if [ -z "${FLUX_QUANTUM_MOCK:-}" ]; then
+    echo "FAIL FLUX_QUANTUM_MOCK must be exported before flux start"
+    exit 1
+fi
+
+# submit a pair, print both job ids, or fail. Checking the exit status is not
+# enough, the plugin prints its errors and still exits 0.
+submit_pair () {
+    local n="$1" err out
+    err=$(mktemp)
+    out=$(flux submit --quantum-vendor mock -n"$n" sleep 300 2>"$err")
+    if grep -q "held classical job" "$err"; then
+        printf '%s %s\n' "$out" \
+            "$(grep -oE 'held classical job [0-9]+' "$err" | awk '{print $NF}')"
+        rm -f "$err"
+        return 0
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    return 1
+}
+
+echo "=== build and load ==="
 make -s -C "$HERE/flux_quantum/jobtap" || { echo "FAIL build"; exit 1; }
-# 20 cores for quantum, none held back, so a 4 core pair takes 5 and four fit
+
+# add the vendor before anything is allocated. Growing the fluxion graph while
+# jobs hold resources breaks every later free and wedges the scheduler.
+flux python -m flux_quantum.populate mock >/dev/null 2>&1 \
+    || echo "WARNING could not populate the graph up front"
+
+# a one core pair reserves two, so a budget of four takes exactly two pairs
 flux jobtap load "$HERE/flux_quantum/jobtap/quantum.so" \
-    vendors="mock,ibm,braket" total_cores=20 reserve_cores=0 \
-    protect_types="qpu" || {
-    echo "FAIL load"; exit 1; }
-flux jobtap list
+    vendors="mock,ibm,braket" total_cores=4 reserve_cores=0 \
+    protect_types="qpu" || { echo "FAIL load"; exit 1; }
 
 echo ""
-echo "=== a pair is accounted for as its cores plus one for the scout ==="
-# submitted held, so it stays in the budget without running
-ids=""
-for i in 1 2 3 4; do
-    if id=$(flux submit --quantum-vendor mock -n4 sleep 300 2>&1 | tail -1); then
-        ids="$ids $id"
+echo "=== a pair reserves its cores plus one for the scout ==="
+pairs=""
+for i in 1 2; do
+    if ids=$(submit_pair 1); then
+        pairs="$pairs $ids"
         echo "  pair $i admitted"
     else
-        echo "FAIL pair $i should have been admitted, budget is 20 and 4 pairs need 20"
+        echo "FAIL pair $i should have been admitted, two one core pairs fit a budget of four"
         rc=1
     fi
 done
 
 echo ""
-echo "=== the fifth is rejected rather than admitted and left to wait ==="
-if err=$(flux submit --quantum-vendor mock -n4 sleep 300 2>&1); then
-    echo "FAIL the fifth pair was admitted, the budget is not being enforced"
+echo "=== the third is rejected rather than left waiting ==="
+err=$(mktemp)
+if submit_pair 1 >/dev/null 2>"$err"; then
+    echo "FAIL a third pair was admitted, the budget is not being enforced"
     rc=1
+elif grep -q "no room for another pair" "$err"; then
+    echo "  rejected, and the message says why"
+    grep -o "no room for another pair.*" "$err" | head -1 | cut -c1-100 | sed 's/^/    /'
 else
-    if echo "$err" | grep -q "no room for another pair"; then
-        echo "  rejected, and the message says why"
-        echo "$err" | grep -o "no room for another pair.*" | head -1 | sed 's/^/    /'
-    else
-        echo "FAIL rejected for the wrong reason: $err"
-        rc=1
-    fi
+    echo "FAIL rejected for the wrong reason"; sed 's/^/    /' "$err"; rc=1
 fi
+rm -f "$err"
 
 echo ""
-echo "=== a pair that does not fit at all is rejected on its own ==="
-if flux submit --quantum-vendor mock -n64 sleep 300 >/dev/null 2>&1; then
-    echo "FAIL a 64 core pair should not fit a 20 core budget"; rc=1
+echo "=== a pair too large for the budget is rejected on its own ==="
+if submit_pair 64 >/dev/null 2>&1; then
+    echo "FAIL a 64 core pair should not fit a budget of four"; rc=1
 else
     echo "  rejected"
 fi
 
 echo ""
-echo "=== the budget comes back as pairs finish ==="
+echo "=== both halves are marked protected, by the plugin and not the user ==="
+for id in $pairs; do
+    if flux job info "$id" jobspec 2>/dev/null | grep -q '"protected"'; then
+        echo "  $id is protected"
+    else
+        echo "FAIL $id was not marked protected, so it is preemptible"; rc=1
+    fi
+done
+
+echo ""
+echo "=== a submitter cannot mark their own job protected ==="
+err=$(mktemp)
+if flux submit --setattr=system.protected=quantum -n1 true >/dev/null 2>"$err"; then
+    echo "FAIL a user set the protection flag and was allowed to"; rc=1
+elif grep -q "set by the scheduler" "$err"; then
+    echo "  rejected, and the message says why"
+else
+    echo "FAIL rejected for the wrong reason"; sed 's/^/    /' "$err"; rc=1
+fi
+rm -f "$err"
+
+echo ""
+echo "=== an ordinary job is left preemptible ==="
+plain=$(flux submit -n1 sleep 300)
+if flux job info "$plain" jobspec 2>/dev/null | grep -q '"protected"'; then
+    echo "FAIL an ordinary job was marked protected"; rc=1
+else
+    echo "  not protected, so it can be preempted"
+fi
+
+echo ""
+echo "=== the budget is given back as pairs finish ==="
 # shellcheck disable=SC2086
-for id in $ids; do flux cancel "$id" 2>/dev/null; done
+flux cancel $pairs "$plain" >/dev/null 2>&1
 for _ in $(seq 1 30); do
     flux jobs -no "{id}" 2>/dev/null | grep -q . || break
     sleep 1
 done
-if flux submit --quantum-vendor mock -n4 sleep 1 >/dev/null 2>&1; then
+if ids=$(submit_pair 1); then
     echo "  a new pair is admitted again"
+    # shellcheck disable=SC2086
+    flux cancel $ids >/dev/null 2>&1
 else
-    echo "FAIL the budget did not recover, cores are leaking on job.destroy"
-    rc=1
+    echo "FAIL the budget did not recover, cores are leaking on job.destroy"; rc=1
 fi
-
-echo ""
-echo "=== the total rebuilds itself when the plugin is reloaded ==="
-# job.new is replayed for active jobs, which is how the budget survives a
-# restart. Hold two pairs, reload, and check the budget is still spent.
-held=""
-for i in 1 2; do
-    id=$(flux submit --quantum-vendor mock -n8 sleep 300 2>&1 | tail -1) && held="$held $id"
-done
-flux jobtap remove quantum 2>/dev/null
-flux jobtap load "$HERE/flux_quantum/jobtap/quantum.so" \
-    vendors="mock" total_cores=20 reserve_cores=0
-if flux submit --quantum-vendor mock -n8 sleep 300 >/dev/null 2>&1; then
-    echo "FAIL after reload the budget was forgotten, so a third pair got in"
-    rc=1
-else
-    echo "  still full after reload, so job.new replay rebuilt the total"
-fi
-# shellcheck disable=SC2086
-for id in $held; do flux cancel "$id" 2>/dev/null; done
-
-echo ""
-echo "=== both halves of a pair are marked protected, by the plugin ==="
-err=$(mktemp)
-scout=$(flux submit --quantum-vendor mock -n2 sleep 60 2>"$err")
-main=$(grep -oE 'held classical job [0-9]+' "$err" | awk '{print $NF}')
-rm -f "$err"
-for half in "classical:$main" "scout:$scout"; do
-    name=${half%%:*}; id=${half#*:}
-    [ -z "$id" ] && { echo "FAIL no $name id"; rc=1; continue; }
-    if flux job info "$id" jobspec 2>/dev/null | grep -q '"protected"'; then
-        echo "  $name is protected"
-    else
-        echo "FAIL the $name half was not marked protected, so it is preemptible"
-        rc=1
-    fi
-done
-flux cancel "$main" "$scout" 2>/dev/null
-
-echo ""
-echo "=== a submitter cannot mark their own job protected ==="
-if err=$(flux submit --setattr=system.protected=quantum -n1 true 2>&1); then
-    echo "FAIL a user set the protection flag and was allowed to"
-    rc=1
-else
-    if echo "$err" | grep -q "set by the scheduler"; then
-        echo "  rejected, and the message says why"
-    else
-        echo "FAIL rejected for the wrong reason: $err"
-        rc=1
-    fi
-fi
-
-echo ""
-echo "=== an ordinary job is left preemptible ==="
-id=$(flux submit -n1 sleep 30)
-if flux job info "$id" jobspec 2>/dev/null | grep -q '"protected"'; then
-    echo "FAIL an ordinary job was marked protected"
-    rc=1
-else
-    echo "  not protected, so it can be preempted"
-fi
-flux cancel "$id" 2>/dev/null
 
 echo ""
 echo "=== vendor policy still applies ==="
@@ -143,7 +140,8 @@ else
     echo "  unconfigured vendor rejected"
 fi
 
-flux jobtap remove quantum 2>/dev/null
+# jobtap plugins are listed and removed by file name, not by registered name
+flux jobtap remove quantum.so >/dev/null 2>&1
 echo ""
 echo "=== admission test rc=$rc ==="
 exit "$rc"

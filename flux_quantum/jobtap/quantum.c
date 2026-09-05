@@ -168,15 +168,16 @@ static const char *idkey (flux_jobid_t id, char *buf, size_t len)
 }
 
 /* remember a job so it can be considered as a victim later */
-static void track (flux_jobid_t id, int cores, int protected_)
+static void track (flux_jobid_t id, int cores, int protected_, int pair)
 {
     char key[32];
     json_t *entry;
 
     if (!g_jobs)
         return;
-    entry = json_pack ("{s:i s:b s:f}",
-                       "cores", cores, "protected", protected_, "run", 0.0);
+    entry = json_pack ("{s:i s:b s:b s:f}",
+                       "cores", cores, "protected", protected_,
+                       "pair", pair, "run", 0.0);
     if (entry)
         (void) json_object_set_new (g_jobs, idkey (id, key, sizeof (key)), entry);
 }
@@ -426,41 +427,43 @@ done:
     free (g);
 }
 
-/* The scout posts the session memo immediately before releasing the classical
- * job, so the memo is the signal that the job should now be able to start. */
-static int event_cb (flux_plugin_t *p,
+/* Start the clock when the classical half reaches SCHED.
+ *
+ * The memo would be the natural signal, since the scout posts it immediately
+ * before releasing. But on a full machine the scout cannot get a core either,
+ * so there is no memo and the pair waits forever with nothing to trigger on.
+ * Admission already promised this pair room, so the promise is what the clock
+ * hangs off, not the handover.
+ */
+static int sched_cb (flux_plugin_t *p,
                      const char *topic,
                      flux_plugin_arg_t *args,
                      void *arg)
 {
     flux_jobid_t id;
-    const char *name = NULL;
     json_t *entry;
     struct grace *g;
-    int cores = 0;
+    int cores = 0, pair = 0;
     flux_t *h;
 
     if (g_preempt_after <= 0.0)
         return 0;
-    if (flux_plugin_arg_unpack (args, FLUX_PLUGIN_ARG_IN,
-                                "{s:I s:{s:s}}",
-                                "id", &id,
-                                "entry", "name", &name) < 0)
-        return 0;
-    if (!name || strcmp (name, "memo") != 0)
+    if (flux_plugin_arg_unpack (args, FLUX_PLUGIN_ARG_IN, "{s:I}", "id", &id) < 0)
         return 0;
     if (!(entry = lookup (id))
-        || json_unpack (entry, "{s:i}", "cores", &cores) < 0
+        || json_unpack (entry, "{s:i s:b}", "cores", &cores, "pair", &pair) < 0
+        || !pair
         || cores <= 0)
-        return 0;
+        return 0;   /* not the classical half of a pair */
 
     h = flux_jobtap_get_flux (p);
     if (!(g = calloc (1, sizeof (*g))))
         return 0;
     g->p = p;
     g->id = id;
-    /* the pair reserves cores + 1, but the scout already holds its own core */
-    g->cores = cores - 1 > 0 ? cores - 1 : cores;
+    /* cores is the whole pair, classical plus one for the scout. Neither may
+     * be running, so make room for both. */
+    g->cores = cores;
     if (!(g->w = flux_timer_watcher_create (flux_get_reactor (h),
                                             g_preempt_after, 0.,
                                             grace_cb, g))) {
@@ -495,7 +498,8 @@ static int new_cb (flux_plugin_t *p,
      * apart from losing the run time, which the state callback restores. */
     track (id,
            vendor ? pair_cores (jobspec) : count_tree_cores_top (jobspec),
-           needs_protection (jobspec, vendor));
+           needs_protection (jobspec, vendor),
+           vendor ? 1 : 0);
     if (g_preempt_after > 0.0)
         (void) flux_jobtap_job_subscribe (p, id);
 
@@ -563,7 +567,7 @@ static const struct flux_plugin_handler handlers[] = {
     { "job.validate",     validate_cb, NULL },
     { "job.new",          new_cb,      NULL },
     { "job.state.run",    run_cb,      NULL },
-    { "job.event.memo",   event_cb,    NULL },
+    { "job.state.sched",  sched_cb,    NULL },
     { "job.destroy",      destroy_cb,  NULL },
     { 0 },
 };
