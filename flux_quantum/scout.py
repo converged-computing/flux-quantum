@@ -24,10 +24,17 @@ def post_session(handle, jobid, session, rpc=None):
 
     The memo RPC is FLUX_ROLE_USER and authorized against the job owner, so
     this needs no shared filesystem and no instance owner privilege.
+
+    The released key is the durable record that this job was let go. A release
+    otherwise lives only in the scheduler memory, so a qmanager restart would
+    read the hold attribute again and park the job a second time, with nobody
+    left to release it and a vendor session already open and being paid for.
+    The eventlog survives a restart, so fluxion reads the marker from there.
     """
     if rpc is None:
         rpc = handle.rpc
-    rpc("job-manager.memo", {"id": int(jobid), "memo": {SESSION_KEY: session}}).get()
+    memo = {SESSION_KEY: session, "released": 1}
+    rpc("job-manager.memo", {"id": int(jobid), "memo": memo}).get()
 
 
 def wait_for_job(handle, jobid, waiter=None):

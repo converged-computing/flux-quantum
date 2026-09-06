@@ -63,6 +63,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <errno.h>
 #include <syslog.h>
 #include <jansson.h>
 #include <flux/core.h>
@@ -563,6 +564,108 @@ static int run_cb (flux_plugin_t *p,
     return 0;
 }
 
+/* Sum cores over running jobs, and separately over running jobs that a pair is
+ * allowed to preempt. track() records every job, not only pairs, so this is
+ * derivable from state the plugin already holds and needs no query to fluxion.
+ *
+ * Note fluxion cannot answer this question. It knows free and allocated, but
+ * "allocated and preemptible" depends on attributes.system.protected, which is
+ * a concept of this plugin that fluxion has never seen.
+ */
+static void occupancy (int *runningp, int *preemptiblep)
+{
+    const char *key;
+    json_t *entry;
+    int running = 0, preemptible = 0;
+
+    if (g_jobs) {
+        json_object_foreach (g_jobs, key, entry) {
+            int prot = 0, c = 0;
+            double run = 0.0;
+
+            if (json_unpack (entry, "{s:i s:b s:F}",
+                             "cores", &c, "protected", &prot, "run", &run) < 0)
+                continue;
+            if (run <= 0.0 || c <= 0)
+                continue;           /* not running, so occupying nothing */
+            running += c;
+            if (!prot)
+                preemptible += c;
+        }
+    }
+    if (runningp)
+        *runningp = running;
+    if (preemptiblep)
+        *preemptiblep = preemptible;
+}
+
+/* Can a pair of pair_cores classical cores plus one scout core be placed, now
+ * or by preempting? Returns 1 for yes, 0 for no, and fills the counts.
+ *
+ * The scout's core comes out of the budget before the comparison, which is why
+ * this is "- 1" rather than comparing against pair_cores + 1. Same condition,
+ * written the way the requirement was specified.
+ */
+static int pair_fits (int pair_cores, int *freep, int *preemptiblep)
+{
+    int running = 0, preemptible = 0, budget_free;
+
+    occupancy (&running, &preemptible);
+    budget_free = budget () - running;
+    if (budget_free < 0)
+        budget_free = 0;
+    if (freep)
+        *freep = budget_free;
+    if (preemptiblep)
+        *preemptiblep = preemptible;
+    if (pair_cores <= 0)
+        return 0;
+    return (budget_free + preemptible - 1) >= pair_cores;
+}
+
+/* job-manager.quantum.check
+ *
+ * Asked by the submitting client BEFORE either half of a pair is created, so
+ * that a pair which cannot be placed never opens a vendor session. The old
+ * check compared outstanding pairs against total capacity, which is a quota
+ * across pairs rather than a feasibility test, so a 9 core pair was admitted
+ * onto a cluster with 7 cores free.
+ *
+ * There is a race between this answer and the submits that follow it. That is
+ * accepted: the caller cancels whichever half survives if the other fails, and
+ * the job.validate check below remains as a backstop.
+ */
+static void check_cb (flux_t *h, flux_msg_handler_t *mh,
+                      const flux_msg_t *msg, void *arg)
+{
+    int pair_cores = 0, free_cores = 0, preemptible = 0, ok;
+
+    if (flux_request_unpack (msg, NULL, "{s:i}", "pair_cores", &pair_cores) < 0) {
+        if (flux_respond_error (h, msg, EPROTO, NULL) < 0)
+            flux_log_error (h, "quantum.check: error responding");
+        return;
+    }
+    if (pair_cores <= 0) {
+        if (flux_respond_error (h, msg, EINVAL,
+                                "pair_cores must be greater than zero") < 0)
+            flux_log_error (h, "quantum.check: error responding");
+        return;
+    }
+    if (g_total_cores <= 0) {
+        /* admission control is off, so there is nothing to promise */
+        if (flux_respond_pack (h, msg, "{s:b s:i s:i s:b}",
+                               "ok", 1, "free", 0, "preemptible", 0,
+                               "enforced", 0) < 0)
+            flux_log_error (h, "quantum.check: error responding");
+        return;
+    }
+    ok = pair_fits (pair_cores, &free_cores, &preemptible);
+    if (flux_respond_pack (h, msg, "{s:b s:i s:i s:b}",
+                           "ok", ok, "free", free_cores,
+                           "preemptible", preemptible, "enforced", 1) < 0)
+        flux_log_error (h, "quantum.check: error responding");
+}
+
 static const struct flux_plugin_handler handlers[] = {
     { "job.validate",     validate_cb, NULL },
     { "job.new",          new_cb,      NULL },
@@ -578,17 +681,36 @@ int flux_plugin_init (flux_plugin_t *p)
     const char *protect_types = NULL;
     int total = 0, reserve = 0;
     double preempt_after = 0.0;
-
+    flux_t *h = flux_jobtap_get_flux (p);
+    int rc;
 
     if (!(g_jobs = json_object ()))
         return -1;
 
-    if (flux_plugin_conf_unpack (p, "{s?s s?s s?i s?i s?F}",
-                                 "vendors", &vendors,
-                                 "protect_types", &protect_types,
-                                 "total_cores", &total,
-                                 "reserve_cores", &reserve,
-                                 "preempt_after", &preempt_after) == 0) {
+    /* One unpack sets everything, so any single key of an unexpected type
+     * returns -1 and none of it is applied. The defaults that would then be
+     * left in place are total_cores 0, which turns admission control off, and
+     * preempt_after 0, which turns preemption off. Loading unenforced and
+     * saying nothing is worse than not loading, so refuse.
+     *
+     * ENOENT is different. It means no conf was given at all, which is a
+     * legitimate way to ask for the defaults.
+     */
+    rc = flux_plugin_conf_unpack (p, "{s?s s?s s?i s?i s?F}",
+                                  "vendors", &vendors,
+                                  "protect_types", &protect_types,
+                                  "total_cores", &total,
+                                  "reserve_cores", &reserve,
+                                  "preempt_after", &preempt_after);
+    if (rc < 0 && errno != ENOENT) {
+        flux_log (h, LOG_ERR,
+                  "quantum: cannot read plugin config: %s. Not loading, "
+                  "because loading with defaults would leave admission control "
+                  "and preemption off without saying so",
+                  flux_plugin_strerror (p));
+        return -1;
+    }
+    if (rc == 0) {
         if (vendors)
             g_vendors = strdup (vendors);
         if (protect_types)
@@ -596,15 +718,55 @@ int flux_plugin_init (flux_plugin_t *p)
         g_total_cores = total;
         g_reserve_cores = reserve;
         g_preempt_after = preempt_after;
-        if (g_preempt_after > 0.0)
-            flux_log (flux_jobtap_get_flux (p), LOG_WARNING,
-                      "quantum: preemption is on. An unprotected job may be "
-                      "cancelled to make room for a pair whose session is "
-                      "already open, and a cancelled job loses its work");
     }
 
-    /* registers the table and sets the plugin name in one call */
-    return flux_plugin_register (p, "quantum", handlers);
+    /* State what is in force. A campaign was once run with preemption off
+     * because the key was absent from the config, and nothing in the logs or
+     * the results said so.
+     */
+    flux_log (h, LOG_INFO,
+              "quantum: vendors=%s total_cores=%d reserve_cores=%d "
+              "protect_types=%s preempt_after=%.1f",
+              g_vendors ? g_vendors : "(default)",
+              g_total_cores,
+              g_reserve_cores,
+              g_protect_types ? g_protect_types : "(default)",
+              g_preempt_after);
+    if (g_total_cores <= 0)
+        flux_log (h, LOG_WARNING,
+                  "quantum: total_cores is not set, so admission control is "
+                  "off and a pair may be admitted that cannot be placed");
+    if (g_preempt_after > 0.0)
+        flux_log (h, LOG_WARNING,
+                  "quantum: preemption is on. An unprotected job may be "
+                  "cancelled to make room for a pair whose session is "
+                  "already open, and a cancelled job loses its work");
+    else
+        flux_log (h, LOG_WARNING,
+                  "quantum: preemption is off. A pair that cannot be placed "
+                  "will hold an open vendor session until the machine frees "
+                  "up on its own");
+
+    /* The plugin name has to be set first: the service is named
+     * job-manager.<plugin>.<method>, so registering it before
+     * flux_plugin_register fails with EINVAL and takes the job manager down
+     * with it.
+     */
+    if (flux_plugin_register (p, "quantum", handlers) < 0) {
+        flux_log_error (h, "quantum: could not register handlers");
+        return -1;
+    }
+
+    /* Expose job-manager.quantum.check. The _ex form with FLUX_ROLE_USER is
+     * required because the system instance sets allow-guest-user, so ordinary
+     * users must be able to ask before they submit.
+     */
+    if (flux_jobtap_service_register_ex (p, "check", FLUX_ROLE_USER,
+                                         check_cb, NULL) < 0) {
+        flux_log_error (h, "quantum: could not register the check service");
+        return -1;
+    }
+    return 0;
 }
 
 /* vi: ts=4 sw=4 expandtab

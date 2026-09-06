@@ -37,6 +37,31 @@ def _wrap_commands(jobspec_dict, wrap_path):
         task["command"] = ["flux", "python", wrap_path, "--"] + cmd
 
 
+def _check_pair_fits(handle, cores, rpc_fn=None):
+    """Refuse a pair that cannot be placed, before either half is created."""
+    try:
+        if rpc_fn is None:
+            resp = handle.rpc(
+                "job-manager.quantum.check", {"pair_cores": int(cores)}
+            ).get()
+        else:
+            resp = rpc_fn(handle, int(cores))
+    except Exception:
+        # The plugin may be absent, or too old to serve the method. Admission is
+        # then whatever the plugin does at validate, which is how this worked
+        # before the check existed, so do not block the submit on it.
+        return
+    if not resp.get("ok", True):
+        raise SystemExit(
+            "flux quantum: no room for this pair. It needs {} cores plus one "
+            "for the scout, and the cluster has {} free and {} preemptible. "
+            "Submitting anyway would open a vendor session for a pair that "
+            "cannot run.".format(
+                cores, resp.get("free", "?"), resp.get("preemptible", "?")
+            )
+        )
+
+
 def _safe_cancel(cancel_fn, handle, jobid, reason):
     """Cancel the held job so a failed setup does not park it forever."""
     try:
@@ -97,6 +122,21 @@ def prepare_pair(
     quantum["cores"] = qresource.count_cores(classical)
     if job_env:
         sysattr.setdefault("environment", {}).update(job_env)
+
+    # Ask before creating anything. The plugin's own admission check only fires
+    # once a job exists, and it compares outstanding pairs against total
+    # capacity, which is a quota across pairs rather than a feasibility test: a
+    # 9 core pair was admitted onto a cluster with 7 cores free, could not be
+    # placed, and left preemption to clean up.
+    #
+    # job-manager.quantum.check answers "does free + preemptible leave room for
+    # this classical and a scout", from occupancy the plugin already tracks.
+    # Asking here means a pair that cannot be placed never opens a session.
+    #
+    # There is a race between this answer and the submits below. That is
+    # accepted: the plugin's job.validate check is still the backstop, and
+    # either half is cancelled if the other fails.
+    _check_pair_fits(handle, quantum["cores"])
 
     # if feasibility validation is on, an unsatisfiable request is rejected here
     # and we abort before spending any quantum quota

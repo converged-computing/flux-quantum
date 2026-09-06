@@ -114,12 +114,12 @@ jobs:
       # the core budget over unfinished pairs, rejecting a pair whose classical
       # half could not be placed rather than admitting it
       - name: jobtap admission control
-        run: flux start bash tests/integration/test-admission.sh
+        run: FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-admission.sh
 
       # preemption is destructive, so it runs on its own. Skips itself when the
       # runner has fewer than three cores.
       - name: jobtap preemption
-        run: flux start bash tests/integration/test-preemption.sh
+        run: FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-preemption.sh
 
       # one submit gives a held classical and a scout, and the qpu stays
       # allocated until the classical is done

@@ -17,7 +17,10 @@ if [ -z "${FLUX_QUANTUM_MOCK:-}" ]; then
     exit 1
 fi
 
-CORES=$(flux resource list -no "{ncores}" 2>/dev/null | head -1)
+# -s all, not a bare -no "{ncores}". Without a state field in the format,
+# flux resource list merges free, allocated and down onto one line, so the bare
+# form returns the total while reading like the free count.
+CORES=$(flux resource list -s all -no "{ncores}" 2>/dev/null)
 CORES=${CORES:-0}
 echo "=== cluster has $CORES cores ==="
 if [ "$CORES" -lt 3 ]; then

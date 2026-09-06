@@ -83,10 +83,22 @@ def populate(handle, vendors, qpus=1, graph=None, lister=None, force=False):
         return set()
 
     if not force:
+        # Being unable to read the allocation count is not evidence that the
+        # instance is idle. Growing the graph while jobs hold resources
+        # corrupts fluxion irrecoverably, so an unknown answer has to be
+        # treated the same as a busy one.
         try:
             busy = allocated_cores(handle, lister)
-        except Exception:
-            busy = 0  # cannot tell, so do not block the caller
+        except Exception as exc:
+            raise RuntimeError(
+                "quantum: {} would have to be added to the fluxion graph, but "
+                "the allocated core count could not be read ({}), so there is "
+                "no way to tell whether the instance is idle. Growing a busy "
+                "graph breaks resource release for every running job. Populate "
+                "at startup with flux python -m flux_quantum.populate, or pass "
+                "force=True if you know the instance is "
+                "idle".format(", ".join(missing), exc)
+            )
         if busy:
             raise RuntimeError(
                 "quantum: {} would have to be added to the fluxion graph, but "

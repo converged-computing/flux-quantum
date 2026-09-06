@@ -172,3 +172,26 @@ def test_abort_still_exits_when_the_cancel_fails():
 
     with pytest.raises(SystemExit):
         abort_held(None, 1, "whatever", cancel=boom)
+
+
+def test_memo_carries_a_durable_release_marker():
+    """A release lives only in scheduler memory, so a qmanager restart would
+    park the job again. The eventlog survives, and fluxion reads it there."""
+    from flux_quantum.scout import post_session, SESSION_KEY
+
+    sent = {}
+
+    class Fut:
+        def get(self):
+            return None
+
+    def rpc(topic, payload):
+        sent["topic"] = topic
+        sent["payload"] = payload
+        return Fut()
+
+    post_session(None, 4021041664, "sess-1", rpc=rpc)
+    memo = sent["payload"]["memo"]
+    assert memo[SESSION_KEY] == "sess-1"
+    assert memo["released"] == 1
+    assert sent["payload"]["id"] == 4021041664

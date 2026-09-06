@@ -347,3 +347,61 @@ def test_classical_carries_its_core_count(stub_flux_cli):
     # what flux submits is the scout, and it carries no quantum attributes
     scout_sys = js.jobspec["attributes"]["system"]
     assert "quantum" not in scout_sys or "cores" not in scout_sys.get("quantum", {})
+
+
+def test_check_pair_fits_rejects_when_there_is_no_room(stub_flux_cli):
+    """A pair that cannot be placed is refused before either half is created."""
+    from flux_quantum import cli
+
+    def rpc(handle, cores):
+        return {"ok": False, "free": 7, "preemptible": 0, "enforced": True}
+
+    try:
+        cli._check_pair_fits(None, 8, rpc_fn=rpc)
+    except SystemExit as exc:
+        assert "no room for this pair" in str(exc)
+        assert "7 free" in str(exc)
+    else:
+        raise AssertionError("a pair with no room was allowed through")
+
+
+def test_check_pair_fits_allows_when_there_is_room(stub_flux_cli):
+    from flux_quantum import cli
+
+    def rpc(handle, cores):
+        return {"ok": True, "free": 8, "preemptible": 120, "enforced": True}
+
+    cli._check_pair_fits(None, 8, rpc_fn=rpc)
+
+
+def test_check_pair_fits_is_permissive_when_the_service_is_absent(stub_flux_cli):
+    """An older plugin serves no check method. Admission then falls back to the
+    job.validate hook, which is how this worked before, so do not block."""
+    from flux_quantum import cli
+
+    def rpc(handle, cores):
+        raise OSError("Function not implemented")
+
+    cli._check_pair_fits(None, 8, rpc_fn=rpc)
+
+
+def test_prepare_pair_asks_before_submitting_anything(stub_flux_cli, monkeypatch):
+    """The check must happen before the classical is created, or a rejected pair
+    still leaves a held job behind."""
+    from flux_quantum import cli
+
+    order = []
+
+    def fake_check(handle, cores, rpc_fn=None):
+        order.append(("checked", cores))
+
+    monkeypatch.setattr(cli, "_check_pair_fits", fake_check)
+
+    def submit(handle, jobspec_json):
+        order.append(("submitted", None))
+        return 12345
+
+    _run_prepare(stub_flux_cli, submit=submit)
+    assert order[0][0] == "checked", order
+    assert order[0][1] > 0
+    assert any(x[0] == "submitted" for x in order)
