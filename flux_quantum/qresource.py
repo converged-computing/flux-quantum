@@ -15,6 +15,8 @@ the graph and the jobspec cannot disagree on type name, nesting or
 exclusivity. No flux imports, just dicts.
 """
 
+import uuid
+
 QDEVICE_PREFIX = "qdevice_"
 QPU = "qpu"
 

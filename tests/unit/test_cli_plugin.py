@@ -245,19 +245,34 @@ def test_prepare_pair_gate_aborts_on_unsatisfiable(stub_flux_cli):
         _run_prepare(stub_flux_cli, submit=rejecting_submit)
 
 
-def test_prepare_pair_cancels_held_classical_on_populate_failure(stub_flux_cli):
-    calls_seen = {}
+def test_populate_failure_leaves_no_held_classical_behind(stub_flux_cli):
+    """The graph is set up before either half is created, so a graph failure
+    has nothing to clean up. It used to happen after the classical was
+    submitted, which meant cancelling a job that had just been held."""
+    seen = {}
 
     def boom_populate(handle, vendors):
         raise RuntimeError("add_subgraph failed")
 
     def rec_cancel(handle, jobid, reason):
-        calls_seen["cancelled"] = jobid
+        seen["cancelled"] = jobid
+
+    def rec_submit(handle, jobspec_json):
+        seen["submitted"] = True
+        return 12345
 
     with pytest.raises(SystemExit):
-        _run_prepare(stub_flux_cli, populate=boom_populate, cancel=rec_cancel)
+        _run_prepare(
+            stub_flux_cli,
+            populate=boom_populate,
+            cancel=rec_cancel,
+            submit=rec_submit,
+        )
 
-    assert calls_seen.get("cancelled") == 12345
+    assert (
+        "submitted" not in seen
+    ), "the classical was created before the graph was ready"
+    assert "cancelled" not in seen, "nothing should need cancelling"
 
 
 def test_scout_duration_covers_the_classical(stub_flux_cli):
@@ -349,40 +364,63 @@ def test_classical_carries_its_core_count(stub_flux_cli):
     assert "quantum" not in scout_sys or "cores" not in scout_sys.get("quantum", {})
 
 
-def test_check_pair_fits_rejects_when_there_is_no_room(stub_flux_cli):
-    """A pair that cannot be placed is refused before either half is created."""
+def test_check_pair_fits_rejects_when_the_pair_cannot_be_placed(stub_flux_cli):
+    """A pair that cannot be scheduled together is refused before either half
+    is created, because the scout would open a metered session for a classical
+    job that cannot start."""
+    import errno
+
     from flux_quantum import cli
 
-    def rpc(handle, cores):
-        return {"ok": False, "free": 7, "preemptible": 0, "enforced": True}
+    def rpc(handle, payload):
+        raise OSError(errno.EBUSY, "the group does not fit right now")
 
     try:
-        cli._check_pair_fits(None, 8, rpc_fn=rpc)
+        cli._check_pair_fits(None, {"a": 1}, {"b": 2}, rpc_fn=rpc)
     except SystemExit as exc:
-        assert "no room for this pair" in str(exc)
-        assert "7 free" in str(exc)
+        assert "cannot be scheduled together" in str(exc)
     else:
-        raise AssertionError("a pair with no room was allowed through")
+        raise AssertionError("a pair that cannot be placed was allowed through")
 
 
-def test_check_pair_fits_allows_when_there_is_room(stub_flux_cli):
+def test_check_pair_fits_sends_both_halves_and_their_ops(stub_flux_cli):
+    """The question is about the pair, so both jobspecs go, the scout to be
+    allocated and the classical to be reserved. No jobids, since neither job
+    exists yet."""
     from flux_quantum import cli
 
-    def rpc(handle, cores):
-        return {"ok": True, "free": 8, "preemptible": 120, "enforced": True}
+    seen = {}
 
-    cli._check_pair_fits(None, 8, rpc_fn=rpc)
+    def rpc(handle, payload):
+        seen.update(payload)
+        return {"fits": True}
+
+    cli._check_pair_fits(None, {"classical": 1}, {"scout": 1}, rpc_fn=rpc)
+    assert seen["check"] is True
+    ops = [j["op"] for j in seen["jobs"]]
+    assert sorted(ops) == ["allocate", "reserve"]
+    assert {"scout": 1} in [j["jobspec"] for j in seen["jobs"]]
+    assert {"classical": 1} in [j["jobspec"] for j in seen["jobs"]]
+    assert all("jobid" not in j for j in seen["jobs"])
 
 
-def test_check_pair_fits_is_permissive_when_the_service_is_absent(stub_flux_cli):
-    """An older plugin serves no check method. Admission then falls back to the
-    job.validate hook, which is how this worked before, so do not block."""
+def test_check_pair_fits_is_permissive_when_it_cannot_ask(stub_flux_cli):
+    """An older fluxion serves no such method, and none may be loaded at all.
+    Admission then falls back to the plugin's job.validate hook, which is how
+    this worked before the check existed, so do not block a submit."""
+    import errno
+
     from flux_quantum import cli
 
-    def rpc(handle, cores):
-        raise OSError("Function not implemented")
+    def missing(handle, payload):
+        raise OSError(errno.ENOSYS, "Function not implemented")
 
-    cli._check_pair_fits(None, 8, rpc_fn=rpc)
+    cli._check_pair_fits(None, {"a": 1}, {"b": 2}, rpc_fn=missing)
+
+    def broken(handle, payload):
+        raise RuntimeError("no usable handle")
+
+    cli._check_pair_fits(None, {"a": 1}, {"b": 2}, rpc_fn=broken)
 
 
 def test_prepare_pair_asks_before_submitting_anything(stub_flux_cli, monkeypatch):
@@ -392,16 +430,17 @@ def test_prepare_pair_asks_before_submitting_anything(stub_flux_cli, monkeypatch
 
     order = []
 
-    def fake_check(handle, cores, rpc_fn=None):
-        order.append(("checked", cores))
+    def fake_check(handle, classical, scout, rpc_fn=None):
+        order.append(("checked", classical, scout))
 
     monkeypatch.setattr(cli, "_check_pair_fits", fake_check)
 
     def submit(handle, jobspec_json):
-        order.append(("submitted", None))
+        order.append(("submitted", None, None))
         return 12345
 
     _run_prepare(stub_flux_cli, submit=submit)
     assert order[0][0] == "checked", order
-    assert order[0][1] > 0
+    # both halves were described to the check
+    assert order[0][1] is not None and order[0][2] is not None
     assert any(x[0] == "submitted" for x in order)

@@ -133,6 +133,38 @@ else
 fi
 
 echo ""
+echo "=== a pair is refused when the machine cannot reach its cores ==="
+# Admission has to mean the pair will be able to run. A quota against total
+# capacity would let this through: the numbers fit the budget, but the cores
+# are not reachable because protected work holds them.
+flux jobtap remove quantum.so >/dev/null 2>&1
+flux jobtap load "$HERE/flux_quantum/jobtap/quantum.so" \
+    vendors="mock" total_cores=16 reserve_cores=0 protect_types="qpu"
+if big=$(submit_pair 12); then
+    echo "  a 12 core pair is admitted: 12 promised, 1 running scout, of 16"
+    err=$(mktemp)
+    if submit_pair 4 >/dev/null 2>"$err"; then
+        echo "FAIL a second pair was admitted, it needs 5 and only 3 are reachable"
+        rc=1
+    elif grep -q "no room for another pair" "$err"; then
+        echo "  the second pair is refused, and the message says what is reachable"
+        grep -o "needs .*reachable" "$err" | head -1 | cut -c1-92 | sed 's/^/    /'
+    else
+        echo "FAIL refused for the wrong reason"; sed 's/^/    /' "$err"; rc=1
+    fi
+    rm -f "$err"
+    # shellcheck disable=SC2086
+    flux cancel $big >/dev/null 2>&1
+else
+    echo "FAIL the first pair should have fit a budget of 16"
+    rc=1
+fi
+for _ in $(seq 1 20); do
+    flux jobs -no "{id}" 2>/dev/null | grep -q . || break
+    sleep 1
+done
+
+echo ""
 echo "=== vendor policy still applies ==="
 if flux submit --quantum-vendor rigetti -n1 true >/dev/null 2>&1; then
     echo "FAIL an unconfigured vendor was accepted"; rc=1

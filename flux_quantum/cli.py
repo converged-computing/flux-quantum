@@ -14,6 +14,7 @@ the submit into the scout. See scout.py for the rest.
 """
 
 import copy
+import errno
 import json
 import os
 import sys
@@ -37,29 +38,45 @@ def _wrap_commands(jobspec_dict, wrap_path):
         task["command"] = ["flux", "python", wrap_path, "--"] + cmd
 
 
-def _check_pair_fits(handle, cores, rpc_fn=None):
-    """Refuse a pair that cannot be placed, before either half is created."""
+def _check_pair_fits(handle, classical, scout, rpc_fn=None):
+    """Refuse a pair that cannot be scheduled, before either half is created.
+
+    Asks fluxion whether both halves could be placed together. It answers by
+    matching the pair for real and undoing it, so the answer is against the
+    live graph rather than a core count, and nothing is left placed. Neither
+    job exists yet, so no jobids are sent.
+
+    A pair that is admitted and then cannot start is the expensive case: the
+    scout opens a metered vendor session and the classical half waits.
+    """
+    payload = {
+        "check": True,
+        "jobs": [
+            {"jobspec": scout, "op": "allocate"},
+            {"jobspec": classical, "op": "reserve"},
+        ],
+    }
     try:
         if rpc_fn is None:
-            resp = handle.rpc(
-                "job-manager.quantum.check", {"pair_cores": int(cores)}
-            ).get()
+            handle.rpc("sched-fluxion-resource.match_coschedule", payload).get()
         else:
-            resp = rpc_fn(handle, int(cores))
-    except Exception:
-        # The plugin may be absent, or too old to serve the method. Admission is
-        # then whatever the plugin does at validate, which is how this worked
-        # before the check existed, so do not block the submit on it.
-        return
-    if not resp.get("ok", True):
+            rpc_fn(handle, payload)
+    except OSError as exc:
+        # EBUSY is fluxion saying the pair does not fit, ENODEV that it never
+        # could. Anything else means the question could not be asked at all,
+        # an older fluxion or none loaded, and that must not block a submit
+        # that would have worked before the check existed.
+        if exc.errno not in (errno.EBUSY, errno.ENODEV, errno.EINVAL):
+            return
         raise SystemExit(
-            "flux quantum: no room for this pair. It needs {} cores plus one "
-            "for the scout, and the cluster has {} free and {} preemptible. "
-            "Submitting anyway would open a vendor session for a pair that "
-            "cannot run.".format(
-                cores, resp.get("free", "?"), resp.get("preemptible", "?")
-            )
+            "flux quantum: this pair cannot be scheduled together. The "
+            "classical half needs its cores and the scout needs one more, and "
+            "the cluster cannot place both. Submitting anyway would open a "
+            "vendor session for a pair that cannot run. ({})".format(exc)
         )
+    except Exception:
+        # no usable handle, so there is nothing to ask
+        return
 
 
 def _safe_cancel(cancel_fn, handle, jobid, reason):
@@ -120,6 +137,7 @@ def prepare_pair(
     # needs the classical size to do that. Counting here rather than walking the
     # jobspec in C.
     quantum["cores"] = qresource.count_cores(classical)
+
     if job_env:
         sysattr.setdefault("environment", {}).update(job_env)
 
@@ -129,14 +147,45 @@ def prepare_pair(
     # 9 core pair was admitted onto a cluster with 7 cores free, could not be
     # placed, and left preemption to clean up.
     #
-    # job-manager.quantum.check answers "does free + preemptible leave room for
-    # this classical and a scout", from occupancy the plugin already tracks.
-    # Asking here means a pair that cannot be placed never opens a session.
+    # So ask fluxion instead, which matches the pair against the live graph and
+    # undoes it. The scout jobspec built here is only for that question, so the
+    # job it would release does not exist yet and the id is a placeholder. Only
+    # the resources matter to the answer.
     #
     # There is a race between this answer and the submits below. That is
     # accepted: the plugin's job.validate check is still the backstop, and
     # either half is cancelled if the other fails.
-    _check_pair_fits(handle, quantum["cores"])
+    # the foothold comes from the live graph so node->...->core matches reality.
+    # Done before either half is created, both because the check below needs the
+    # vendor device present to answer honestly, and because a graph failure then
+    # leaves no held job to clean up.
+    try:
+        populate_fn(handle, [vendor])
+        live = get_graph_fn(handle)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        raise SystemExit(
+            "flux quantum: could not prepare the quantum graph: {}".format(exc)
+        )
+
+    # The scout jobspec built here is only for the question. The job it would
+    # release does not exist yet, so its id is a placeholder and only the
+    # resources matter to the answer.
+    try:
+        probe = build_scout_jobspec(
+            vendor,
+            0,
+            ncores=scout_cores,
+            duration=scout_duration,
+            live_graph=live,
+            scout_path=scout_path,
+            options=options,
+        )
+    except Exception:
+        probe = None
+    if probe is not None:
+        _check_pair_fits(handle, classical, probe)
 
     # if feasibility validation is on, an unsatisfiable request is rejected here
     # and we abort before spending any quantum quota
@@ -148,23 +197,6 @@ def prepare_pair(
         raise SystemExit(
             "flux quantum: classical request not accepted "
             "(unsatisfiable, or ingest error): {}".format(exc)
-        )
-
-    # the foothold comes from the live graph so node->...->core matches reality
-    try:
-        populate_fn(handle, [vendor])
-        live = get_graph_fn(handle)
-    except SystemExit:
-        raise
-    except Exception as exc:
-        _safe_cancel(
-            cancel_fn,
-            handle,
-            main_id,
-            "flux quantum: aborting held classical (graph setup failed)",
-        )
-        raise SystemExit(
-            "flux quantum: could not prepare the quantum graph: {}".format(exc)
         )
 
     try:

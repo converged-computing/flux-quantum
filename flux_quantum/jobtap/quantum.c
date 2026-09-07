@@ -204,6 +204,55 @@ static int budget (void)
     return b > 0 ? b : 0;
 }
 
+/* What a new pair could actually have.
+ *
+ * Everything here comes from the job table the plugin already keeps, so no
+ * query is needed. Three quantities, and the distinctions matter:
+ *
+ *   free         capacity not occupied by anything running
+ *   preemptible  cores held by running work that is not protected, so a pair
+ *                can take them back
+ *   promised     cores already promised to pairs that were admitted but have
+ *                not started. Their cores are not allocated, so they count as
+ *                free, and would otherwise be handed out twice
+ *
+ * A running pair is deliberately not in promised: its cores are already out of
+ * free, and being protected they are not in preemptible either.
+ */
+static void capacity (int *freep, int *preemptiblep, int *promisedp)
+{
+    const char *key;
+    json_t *entry;
+    int running = 0, preemptible = 0, promised = 0;
+
+    if (g_jobs) {
+        json_object_foreach (g_jobs, key, entry) {
+            int cores = 0, prot = 0, pair = 0;
+            double run = 0.0;
+
+            if (json_unpack (entry,
+                             "{s:i s:b s:b s:F}",
+                             "cores", &cores,
+                             "protected", &prot,
+                             "pair", &pair,
+                             "run", &run) < 0)
+                continue;
+            if (cores <= 0)
+                continue;
+            if (run > 0.0) {
+                running += cores;
+                if (!prot)
+                    preemptible += cores;
+            } else if (pair) {
+                promised += cores;
+            }
+        }
+    }
+    *freep = budget () - running > 0 ? budget () - running : 0;
+    *preemptiblep = preemptible;
+    *promisedp = promised;
+}
+
 /* cores this pair reserves. The scout needs one of its own, so a classical of
  * n cores makes the pair n + 1. */
 static int pair_cores (json_t *jobspec)
@@ -328,12 +377,24 @@ static int validate_cb (flux_plugin_t *p,
             return flux_jobtap_reject_job (p, args,
                        "quantum: attributes.system.quantum.cores is missing, "
                        "so this pair cannot be accounted for");
-        if (g_used_cores + want > budget ())
+        /* Admission has to mean this pair will be able to run, not just that
+         * the site has not sold too many. So ask against capacity that is
+         * actually reachable: what is free, plus what can be taken back from
+         * unprotected work, less what is already promised to pairs that have
+         * not started. Comparing against total capacity instead admitted a
+         * pair onto a machine with no room for it, and left preemption to
+         * discover that afterwards with a metered session already open.
+         */
+        int freec = 0, preemptible = 0, promised = 0;
+        capacity (&freec, &preemptible, &promised);
+        if (want + promised > freec + preemptible)
             return flux_jobtap_reject_job (p, args,
-                       "quantum: no room for another pair. %d of %d cores are "
-                       "promised to unfinished pairs and this one needs %d. "
-                       "Wait for one to finish or ask for fewer cores",
-                       g_used_cores, budget (), want);
+                       "quantum: no room for another pair. This one needs %d "
+                       "cores, %d are already promised to pairs that have not "
+                       "started, and only %d are reachable (%d free, %d that "
+                       "could be preempted). Wait for one to finish or ask for "
+                       "fewer cores",
+                       want, promised, freec + preemptible, freec, preemptible);
     }
 
     /* policy satisfied; the job proceeds. The hold is set at submission by the
@@ -462,9 +523,11 @@ static int sched_cb (flux_plugin_t *p,
         return 0;
     g->p = p;
     g->id = id;
-    /* cores is the whole pair, classical plus one for the scout. Neither may
-     * be running, so make room for both. */
-    g->cores = cores;
+    /* The entry records what this job itself asks for, so add the scout's core
+     * back to get what the pair needs. Neither half may be running yet, so
+     * make room for both.
+     */
+    g->cores = cores + 1;
     if (!(g->w = flux_timer_watcher_create (flux_get_reactor (h),
                                             g_preempt_after, 0.,
                                             grace_cb, g))) {
@@ -497,8 +560,12 @@ static int new_cb (flux_plugin_t *p,
      * quantum pair preempts, so the plugin has to know they exist. Called
      * again on replay, and json_object_set overwrites, so this is idempotent
      * apart from losing the run time, which the state callback restores. */
+    /* Record what this job itself asks for, not what its pair asks for. The
+     * scout has its own entry, so charging the classical for n + 1 would count
+     * the scout's core twice once it starts running.
+     */
     track (id,
-           vendor ? pair_cores (jobspec) : count_tree_cores_top (jobspec),
+           count_tree_cores_top (jobspec),
            needs_protection (jobspec, vendor),
            vendor ? 1 : 0);
     if (g_preempt_after > 0.0)
@@ -564,109 +631,37 @@ static int run_cb (flux_plugin_t *p,
     return 0;
 }
 
-/* Sum cores over running jobs, and separately over running jobs that a pair is
- * allowed to preempt. track() records every job, not only pairs, so this is
- * derivable from state the plugin already holds and needs no query to fluxion.
+
+
+
+/* Report the configuration this plugin was actually given.
  *
- * Note fluxion cannot answer this question. It knows free and allocated, but
- * "allocated and preemptible" depends on attributes.system.protected, which is
- * a concept of this plugin that fluxion has never seen.
+ * flux jobtap query otherwise reports only a name and a path, so there is no
+ * way afterwards to tell what a run was configured with. A whole campaign was
+ * once collected with preemption off and nobody could tell from the data, so
+ * this exists to make the settings recoverable.
  */
-static void occupancy (int *runningp, int *preemptiblep)
+static int query_cb (flux_plugin_t *p,
+                     const char *topic,
+                     flux_plugin_arg_t *args,
+                     void *arg)
 {
-    const char *key;
-    json_t *entry;
-    int running = 0, preemptible = 0;
-
-    if (g_jobs) {
-        json_object_foreach (g_jobs, key, entry) {
-            int prot = 0, c = 0;
-            double run = 0.0;
-
-            if (json_unpack (entry, "{s:i s:b s:F}",
-                             "cores", &c, "protected", &prot, "run", &run) < 0)
-                continue;
-            if (run <= 0.0 || c <= 0)
-                continue;           /* not running, so occupying nothing */
-            running += c;
-            if (!prot)
-                preemptible += c;
-        }
-    }
-    if (runningp)
-        *runningp = running;
-    if (preemptiblep)
-        *preemptiblep = preemptible;
-}
-
-/* Can a pair of pair_cores classical cores plus one scout core be placed, now
- * or by preempting? Returns 1 for yes, 0 for no, and fills the counts.
- *
- * The scout's core comes out of the budget before the comparison, which is why
- * this is "- 1" rather than comparing against pair_cores + 1. Same condition,
- * written the way the requirement was specified.
- */
-static int pair_fits (int pair_cores, int *freep, int *preemptiblep)
-{
-    int running = 0, preemptible = 0, budget_free;
-
-    occupancy (&running, &preemptible);
-    budget_free = budget () - running;
-    if (budget_free < 0)
-        budget_free = 0;
-    if (freep)
-        *freep = budget_free;
-    if (preemptiblep)
-        *preemptiblep = preemptible;
-    if (pair_cores <= 0)
-        return 0;
-    return (budget_free + preemptible - 1) >= pair_cores;
-}
-
-/* job-manager.quantum.check
- *
- * Asked by the submitting client BEFORE either half of a pair is created, so
- * that a pair which cannot be placed never opens a vendor session. The old
- * check compared outstanding pairs against total capacity, which is a quota
- * across pairs rather than a feasibility test, so a 9 core pair was admitted
- * onto a cluster with 7 cores free.
- *
- * There is a race between this answer and the submits that follow it. That is
- * accepted: the caller cancels whichever half survives if the other fails, and
- * the job.validate check below remains as a backstop.
- */
-static void check_cb (flux_t *h, flux_msg_handler_t *mh,
-                      const flux_msg_t *msg, void *arg)
-{
-    int pair_cores = 0, free_cores = 0, preemptible = 0, ok;
-
-    if (flux_request_unpack (msg, NULL, "{s:i}", "pair_cores", &pair_cores) < 0) {
-        if (flux_respond_error (h, msg, EPROTO, NULL) < 0)
-            flux_log_error (h, "quantum.check: error responding");
-        return;
-    }
-    if (pair_cores <= 0) {
-        if (flux_respond_error (h, msg, EINVAL,
-                                "pair_cores must be greater than zero") < 0)
-            flux_log_error (h, "quantum.check: error responding");
-        return;
-    }
-    if (g_total_cores <= 0) {
-        /* admission control is off, so there is nothing to promise */
-        if (flux_respond_pack (h, msg, "{s:b s:i s:i s:b}",
-                               "ok", 1, "free", 0, "preemptible", 0,
-                               "enforced", 0) < 0)
-            flux_log_error (h, "quantum.check: error responding");
-        return;
-    }
-    ok = pair_fits (pair_cores, &free_cores, &preemptible);
-    if (flux_respond_pack (h, msg, "{s:b s:i s:i s:b}",
-                           "ok", ok, "free", free_cores,
-                           "preemptible", preemptible, "enforced", 1) < 0)
-        flux_log_error (h, "quantum.check: error responding");
+    if (flux_plugin_arg_pack (args,
+                              FLUX_PLUGIN_ARG_OUT,
+                              "{s:i s:i s:f s:s s:s s:i}",
+                              "total_cores", g_total_cores,
+                              "reserve_cores", g_reserve_cores,
+                              "preempt_after", g_preempt_after,
+                              "vendors", g_vendors ? g_vendors : "",
+                              "protect_types", g_protect_types ? g_protect_types : "",
+                              "used_cores", g_used_cores)
+        < 0)
+        return -1;
+    return 0;
 }
 
 static const struct flux_plugin_handler handlers[] = {
+    { "plugin.query",     query_cb,    NULL },
     { "job.validate",     validate_cb, NULL },
     { "job.new",          new_cb,      NULL },
     { "job.state.run",    run_cb,      NULL },
@@ -757,15 +752,6 @@ int flux_plugin_init (flux_plugin_t *p)
         return -1;
     }
 
-    /* Expose job-manager.quantum.check. The _ex form with FLUX_ROLE_USER is
-     * required because the system instance sets allow-guest-user, so ordinary
-     * users must be able to ask before they submit.
-     */
-    if (flux_jobtap_service_register_ex (p, "check", FLUX_ROLE_USER,
-                                         check_cb, NULL) < 0) {
-        flux_log_error (h, "quantum: could not register the check service");
-        return -1;
-    }
     return 0;
 }
 
