@@ -74,14 +74,6 @@ def build_scout_jobspec(
     }
 
 
-def submit_scout(handle, vendor, hold_job, ncores=1, duration=0, session=None):
-    """Submit the scout job and return the flux JobID."""
-    from flux.job import submit
-
-    jobspec = build_scout_jobspec(vendor, hold_job, ncores, duration, session=session)
-    return submit(handle, json.dumps(jobspec))
-
-
 def main():
     ap = argparse.ArgumentParser(
         prog="quantum-scout-launch",

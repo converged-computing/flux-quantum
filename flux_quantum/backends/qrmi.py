@@ -241,14 +241,7 @@ class QRMIBackend(Backend):
             "QRMI_JOB_QPU_TYPES": options.get("type") or self.default_type,
         }
 
-    @staticmethod
-    def acquisition_token_env(resource, session):
-        """The variable QRMI expects the acquisition token in."""
-        return {resource + ACQUISITION_TOKEN: session}
-
     def open_session(self, options):
-        from qrmi import QuantumResource
-
         resource = options.get("resource")
         rtype = options.get("type") or self.default_type
         if not resource:
@@ -263,6 +256,10 @@ class QRMIBackend(Backend):
                     self.name, resource, ", ".join(resource + s for s in missing)
                 )
             )
+        # deferred so a missing resource or variable is reported as a
+        # ValueError above even when qrmi itself is not installed
+        from qrmi import QuantumResource
+
         self._resource = QuantumResource(resource, resource_type(rtype))
         try:
             self._lock = self._resource.acquire()

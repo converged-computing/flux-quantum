@@ -11,6 +11,7 @@ import os
 import signal
 import sys
 
+from flux_quantum.backends.qrmi import ACQUISITION_TOKEN
 from flux_quantum.scout import SESSION_KEY
 
 
@@ -56,7 +57,7 @@ def session_environment(session, resources=None):
     for resource in resources.split(","):
         resource = resource.strip()
         if resource:
-            env[resource + "_QRMI_JOB_ACQUISITION_TOKEN"] = session
+            env[resource + ACQUISITION_TOKEN] = session
     return env
 
 
