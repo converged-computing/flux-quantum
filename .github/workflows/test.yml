@@ -121,6 +121,10 @@ jobs:
       - name: jobtap preemption
         run: FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-preemption.sh
 
+      # unload with a grace timer pending, and reload with jobs running
+      - name: jobtap unload and reload
+        run: FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-reload.sh
+
       # one submit gives a held classical and a scout, and the qpu stays
       # allocated until the classical is done
       - name: end-to-end, single broker
