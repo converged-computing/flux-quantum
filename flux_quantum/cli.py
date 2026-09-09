@@ -39,15 +39,13 @@ def _wrap_commands(jobspec_dict, wrap_path):
 
 
 def _check_pair_fits(handle, classical, scout, rpc_fn=None):
-    """Refuse a pair that cannot be scheduled, before either half is created.
+    """Refuse a pair the graph can never hold, before either half exists.
 
-    Asks fluxion whether both halves could be placed together. It answers by
-    matching the pair for real and undoing it, so the answer is against the
-    live graph rather than a core count, and nothing is left placed. Neither
-    job exists yet, so no jobids are sent.
-
-    A pair that is admitted and then cannot start is the expensive case: the
-    scout opens a metered vendor session and the classical half waits.
+    The match_coschedule check in the add-hold branch is a satisfiability
+    test. Each half is checked alone against the whole graph with nothing
+    else on it, so this catches a missing qdevice or a half bigger than the
+    machine, not a busy machine. Fit against what is reachable right now is
+    the jobtap plugin's admission check.
     """
     payload = {
         "check": True,
@@ -62,17 +60,24 @@ def _check_pair_fits(handle, classical, scout, rpc_fn=None):
         else:
             rpc_fn(handle, payload)
     except OSError as exc:
-        # EBUSY is fluxion saying the pair does not fit, ENODEV that it never
-        # could. Anything else means the question could not be asked at all,
-        # an older fluxion or none loaded, and that must not block a submit
-        # that would have worked before the check existed.
-        if exc.errno not in (errno.EBUSY, errno.ENODEV, errno.EINVAL):
+        # ENODEV means the graph can never hold the pair. EBUSY would mean a
+        # fluxion that checks the live graph found no room now. Anything else
+        # means the question could not be asked, and that must not block a
+        # submit that worked before the check existed.
+        if exc.errno not in (errno.EBUSY, errno.ENODEV):
+            if exc.errno in (errno.EINVAL, errno.EPROTO):
+                print(
+                    "flux quantum: WARNING fluxion did not understand the pair "
+                    "check, skipping it: {}".format(exc),
+                    file=sys.stderr,
+                )
             return
         raise SystemExit(
-            "flux quantum: this pair cannot be scheduled together. The "
-            "classical half needs its cores and the scout needs one more, and "
-            "the cluster cannot place both. Submitting anyway would open a "
-            "vendor session for a pair that cannot run. ({})".format(exc)
+            "flux quantum: this pair cannot be scheduled together on this "
+            "cluster. The classical half needs its cores and the scout needs "
+            "one more plus the vendor device, and the graph cannot hold both. "
+            "Submitting anyway would open a vendor session for a pair that "
+            "cannot run. ({})".format(exc)
         )
     except Exception:
         # no usable handle, so there is nothing to ask
@@ -141,24 +146,9 @@ def prepare_pair(
     if job_env:
         sysattr.setdefault("environment", {}).update(job_env)
 
-    # Ask before creating anything. The plugin's own admission check only fires
-    # once a job exists, and it compares outstanding pairs against total
-    # capacity, which is a quota across pairs rather than a feasibility test: a
-    # 9 core pair was admitted onto a cluster with 7 cores free, could not be
-    # placed, and left preemption to clean up.
-    #
-    # So ask fluxion instead, which matches the pair against the live graph and
-    # undoes it. The scout jobspec built here is only for that question, so the
-    # job it would release does not exist yet and the id is a placeholder. Only
-    # the resources matter to the answer.
-    #
-    # There is a race between this answer and the submits below. That is
-    # accepted: the plugin's job.validate check is still the backstop, and
-    # either half is cancelled if the other fails.
-    # the foothold comes from the live graph so node->...->core matches reality.
-    # Done before either half is created, both because the check below needs the
-    # vendor device present to answer honestly, and because a graph failure then
-    # leaves no held job to clean up.
+    # Populate and ask fluxion before creating anything, so a pair the graph
+    # can never hold is refused with no held job to clean up. The scout shape
+    # comes from the live graph so the node to core path matches reality.
     try:
         populate_fn(handle, [vendor])
         live = get_graph_fn(handle)
@@ -169,9 +159,7 @@ def prepare_pair(
             "flux quantum: could not prepare the quantum graph: {}".format(exc)
         )
 
-    # The scout jobspec built here is only for the question. The job it would
-    # release does not exist yet, so its id is a placeholder and only the
-    # resources matter to the answer.
+    # only the resources matter to the question, so the job id is a placeholder
     try:
         probe = build_scout_jobspec(
             vendor,
