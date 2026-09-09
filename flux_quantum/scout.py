@@ -20,16 +20,11 @@ SESSION_KEY = "quantum_session"
 
 
 def post_session(handle, jobid, session, rpc=None):
-    """Post the session id to the eventlog of the classical job as a memo.
+    """Memo the session id onto the classical job's eventlog.
 
-    The memo RPC is FLUX_ROLE_USER and authorized against the job owner, so
-    this needs no shared filesystem and no instance owner privilege.
-
-    The released key is the durable record that this job was let go. A release
-    otherwise lives only in the scheduler memory, so a qmanager restart would
-    read the hold attribute again and park the job a second time, with nobody
-    left to release it and a vendor session already open and being paid for.
-    The eventlog survives a restart, so fluxion reads the marker from there.
+    The memo RPC is authorized against the job owner, so no shared filesystem
+    or owner privilege is needed. The released key is what qmanager reads
+    after a restart so it does not hold the job a second time.
     """
     if rpc is None:
         rpc = handle.rpc
@@ -46,12 +41,8 @@ def wait_for_job(handle, jobid, waiter=None):
 
 
 def abort_held(handle, jobid, why, cancel=None):
-    """Cancel the held classical and exit.
-
-    Anything that fails before the release leaves the job held with its
-    reservation and nothing on the way to free it, so cancel it rather than
-    leave nodes parked on work that will never start.
-    """
+    """Cancel the held classical and exit, so a failure before the release
+    does not leave it parked forever."""
     if cancel is None:
         from flux.job import cancel
     try:

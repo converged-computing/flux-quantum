@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
-# Build and submit the scout job.
-#
-# The scout asks for a small classical foothold and the vendor device, so
-# fluxion co-allocates a core and a qpu. That match is the coschedule. When the
-# scout runs it opens the vendor session and releases the held classical job.
-#
-# The mock only replaces the vendor API. The graph match is real, so if
-# qdevice_<vendor> -> qpu is missing the scout is unsatisfiable and never runs.
+# Build the scout jobspec. The scout asks for a small classical foothold and
+# the vendor device, so fluxion co-allocates a core and a qpu. Even with the
+# mock the graph match is real, so a missing qdevice makes it unsatisfiable.
 import argparse
 import json
 import os

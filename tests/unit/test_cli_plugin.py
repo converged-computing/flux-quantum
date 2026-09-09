@@ -247,8 +247,7 @@ def test_prepare_pair_gate_aborts_on_unsatisfiable(stub_flux_cli):
 
 def test_populate_failure_leaves_no_held_classical_behind(stub_flux_cli):
     """The graph is set up before either half is created, so a graph failure
-    has nothing to clean up. It used to happen after the classical was
-    submitted, which meant cancelling a job that had just been held."""
+    has nothing to clean up."""
     seen = {}
 
     def boom_populate(handle, vendors):

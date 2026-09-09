@@ -15,7 +15,10 @@ the scout. qiskit comes along with it and we need that for the warmup task.
 
 QRMI reads its config out of the environment. Every variable is prefixed with the
 resource id, so for ibm_kingston the api key lives in
-`ibm_kingston_QRMI_IBM_QRS_IAM_APIKEY`. Four of them are required. Note that this used to work for me, and it stopped. I now login with the web interface copy paste, which looks like this:
+`ibm_kingston_QRMI_IBM_QRS_IAM_APIKEY`. Four of them are required.
+
+The passcode login below can stop accepting credentials. If it does, use the
+API key login that follows instead.
 
 ```bash
 ibmcloud login -a https://cloud.ibm.com -u passcode -p <pass>
@@ -60,15 +63,17 @@ resource has credentials in the environment you can drop
 
 ## You need an account that can open sessions
 
-The qiskit-runtime-service type opens a session, and IBM only allows that on plans that support sessions (Premium). On Open or Pay As You Go you can submit tasks but you cannot hold a session. You will get an error message (403). Our library will cancel the held classical job. If you have direct access instead, use `--quantum-ibm-type ibm-quantum-system`.
+The qiskit-runtime-service type opens a session, which IBM only allows on plans that support sessions (Premium). Open and Pay As You Go plans can submit tasks but not hold a session, IBM returns a 403, and flux-quantum cancels the held classical job. Use `--quantum-ibm-type ibm-quantum-system` for direct access instead.
 
 ## A session is not the same as having the QPU
 
-An IBM session goes active when its first task reaches the head of the queue.
-After that, tasks in the session keep that priority. So opening a session tells
-you very little on its own. After acquire we have to submit a warmup task and monitor it,
-and it is small (one qubit and one measurement) and wait for it to run. Then we can at least
-say that we reached the top and have priority and we release classical. If the warmup never runs we release the session and fail the submit. The classical job never starts against a QPU we do not have.
+An IBM session goes active when its first task reaches the head of the queue,
+and later tasks in the session inherit that priority. So opening a session
+tells you little by itself. After acquiring, the scout submits a small warmup
+task (one qubit, one measurement) and waits for it to run before releasing the
+classical job. If the warmup never runs, the scout releases the session and
+fails the submit instead of starting the classical job against a QPU it does
+not have.
 
     --quantum-ibm-warmup-timeout SECONDS   give up after this long. Default 0,
                                            which means wait as long as the
@@ -82,17 +87,18 @@ The warmup costs one shot.
 
 ## The scout holds the session for as long as the classical runs
 
-The fluxion allocation and the vendor session start and end
-together. It does mean you are billed for the length of the classical job and not
-the length of the quantum work, so set `-t`.
+The fluxion allocation and the vendor session start and end together, so
+you're billed for the classical job's wall time, not the quantum work. Set
+`-t` accordingly.
 
-A killed scout still releases, the release is in a finally and SIGTERM is
-handled. If the node dies you are down to the vendor timeout.
+A killed scout still releases, since the release runs in a finally block and
+SIGTERM is handled. If the node dies, you're down to the vendor's own timeout.
 
 ## Credentials
 
-The plugin runs in your process at submit time and reads the variables out of
-your environment. The scout uses them, and it runs as you. Only the session id travels to the classical job, and it goes over the job eventlog.
+The plugin runs in your process at submit time and reads the variables from
+your environment. The scout runs as you and uses them too. Only the session
+id reaches the classical job, over the job eventlog.
 
 ## What the classical job sees
 

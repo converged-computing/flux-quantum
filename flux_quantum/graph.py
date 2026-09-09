@@ -64,15 +64,9 @@ def populate(handle, vendors, qpus=1, graph=None, lister=None, force=False):
 
     Idempotent, only missing vendors are added. Returns what was added.
 
-    Growing the graph while jobs hold resources corrupts fluxion. The spans of
-    the running jobs no longer match the graph, so every later free fails with
-    planner_multi_rem_span returned -1, those resources are never released, and
-    the instance stops scheduling anything at all. It looks like free cores that
-    nothing will use.
-
-    So refuse to grow a busy graph. Populate at startup instead, before any
-    jobs run, which is what the vendors are there for anyway. force=True is for
-    a caller that knows the instance is idle.
+    Growing the graph while jobs hold resources corrupts fluxion. Every later
+    free fails with planner_multi_rem_span returned -1 and the instance stops
+    scheduling. So a busy graph is refused unless force is set.
     """
     if isinstance(vendors, str):
         vendors = [vendors]
@@ -83,10 +77,7 @@ def populate(handle, vendors, qpus=1, graph=None, lister=None, force=False):
         return set()
 
     if not force:
-        # Being unable to read the allocation count is not evidence that the
-        # instance is idle. Growing the graph while jobs hold resources
-        # corrupts fluxion irrecoverably, so an unknown answer has to be
-        # treated the same as a busy one.
+        # an unreadable allocation count is treated as busy
         try:
             busy = allocated_cores(handle, lister)
         except Exception as exc:

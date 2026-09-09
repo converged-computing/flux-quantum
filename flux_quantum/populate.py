@@ -5,18 +5,12 @@
 # SPDX-License-Identifier: LGPL-3.0
 ##############################################################
 
-"""Add vendor devices to the fluxion graph once, at startup.
-
-This has to happen before any job holds resources. Growing the graph while jobs
-are allocated corrupts fluxion, every later free fails with
-planner_multi_rem_span returned -1, and the instance stops scheduling. Doing it
-at startup means the first quantum submit never has to grow anything.
+"""Add vendor devices to the fluxion graph once, at startup, before any job
+holds resources. Growing the graph under running jobs corrupts fluxion.
 
     flux python -m flux_quantum.populate ibm braket mock
 
-Run it with flux python, not the system python. The flux bindings are installed
-for whichever interpreter flux was built against, so a console script on the
-default python cannot import them.
+Use flux python so the flux bindings are importable.
 """
 
 import argparse

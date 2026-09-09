@@ -29,10 +29,8 @@ def qdevice_type(vendor):
 def jobspec_resource(vendor, nqpus=1):
     """A scout jobspec resources entry for the vendor device.
 
-    The qpu must be exclusive. Fluxion only adds a planner span and emits a
-    leaf device into R when it is asked for exclusively, since upd_plan calls
-    planner_add_span only inside the excl branch. Ask for it any other way and
-    it is matched but then dropped from the allocation.
+    The qpu must be exclusive. Fluxion only writes a leaf device into R when
+    it is asked for exclusively, otherwise it is matched and then dropped.
     """
     return {
         "type": qdevice_type(vendor),
@@ -149,12 +147,7 @@ def classical_resource(live_graph, ncores=1, label="scout"):
 
 
 def count_cores(jobspec):
-    """Total cores a v1 jobspec asks for.
-
-    Multiplies counts down the resource tree and sums the core leaves. The
-    jobtap plugin needs this to keep a core budget, and doing it here means it
-    is testable without a broker rather than parsed in C.
-    """
+    """Total cores a v1 jobspec asks for, multiplying counts down the tree."""
 
     def walk(entries, factor):
         total = 0

@@ -31,9 +31,8 @@ make -s -C "$HERE/flux_quantum/jobtap" || { echo "FAIL build"; exit 1; }
 flux python -m flux_quantum.populate mock >/dev/null 2>&1 \
     || echo "WARNING could not populate the graph up front"
 
-# query is by the registered name; fall back to the file name for older cores
 query () {
-    flux jobtap query quantum 2>/dev/null || flux jobtap query quantum.so
+    flux jobtap query quantum.so
 }
 
 load () {
