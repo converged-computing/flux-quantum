@@ -134,14 +134,21 @@ fi
 
 echo ""
 echo "=== a pair is refused when the machine cannot reach its cores ==="
-# Admission has to mean the pair will be able to run. A quota against total
-# capacity would let this through: the numbers fit the budget, but the cores
-# are not reachable because protected work holds them.
+# The numbers fit the budget but the cores are held by protected work. Sized
+# from the machine because fluxion refuses a pair bigger than the graph before
+# the budget is asked. A pair of C-4 leaves C-4 promised and one scout
+# running, so 3 are reachable, and a 4 core pair needs 5.
+CORES=$(flux resource list -s all -no "{ncores}" 2>/dev/null)
+CORES=${CORES:-0}
+if [ "$CORES" -lt 6 ]; then
+    echo "SKIP need at least 6 cores, have $CORES"
+else
+FIRST=$((CORES - 4))
 flux jobtap remove quantum.so >/dev/null 2>&1
 flux jobtap load "$HERE/flux_quantum/jobtap/quantum.so" \
-    vendors="mock" total_cores=16 reserve_cores=0 protect_types="qpu"
-if big=$(submit_pair 12); then
-    echo "  a 12 core pair is admitted: 12 promised, 1 running scout, of 16"
+    vendors="mock" total_cores="$CORES" reserve_cores=0 protect_types="qpu"
+if big=$(submit_pair "$FIRST"); then
+    echo "  a $FIRST core pair is admitted: $FIRST promised, 1 running scout, of $CORES"
     err=$(mktemp)
     if submit_pair 4 >/dev/null 2>"$err"; then
         echo "FAIL a second pair was admitted, it needs 5 and only 3 are reachable"
@@ -156,8 +163,9 @@ if big=$(submit_pair 12); then
     # shellcheck disable=SC2086
     flux cancel $big >/dev/null 2>&1
 else
-    echo "FAIL the first pair should have fit a budget of 16"
+    echo "FAIL the first pair should have fit a budget of $CORES"
     rc=1
+fi
 fi
 for _ in $(seq 1 20); do
     flux jobs -no "{id}" 2>/dev/null | grep -q . || break
