@@ -73,6 +73,9 @@ def fake_qrmi(monkeypatch):
     monkeypatch.setitem(sys.modules, "qrmi", mod)
     for k, v in CREDS.items():
         monkeypatch.setenv(k, v)
+    # qrmi is bound when the backend module is imported, so import it again
+    for name in [m for m in sys.modules if m.startswith("flux_quantum")]:
+        del sys.modules[name]
     return FakeResource
 
 
@@ -141,9 +144,12 @@ def test_unknown_resource_type_is_rejected(fake_qrmi):
 
 def test_secrets_never_appear_in_messages(fake_qrmi, monkeypatch):
     """Credential checks report variable names and never values."""
+    from flux_quantum.backends import BackendError
+
     monkeypatch.delenv(RESOURCE + "_QRMI_IBM_QRS_IAM_APIKEY")
-    ok, msg = _ibm().credentials_present()
-    assert not ok
+    with pytest.raises(BackendError) as e:
+        _ibm()
+    msg = str(e.value)
     assert RESOURCE + "_QRMI_IBM_QRS_IAM_APIKEY" in msg
     assert "supersecret" not in msg
 
@@ -301,17 +307,10 @@ def test_warmup_payload_is_a_single_shot_measure(fake_qrmi):
 
 def test_missing_qiskit_says_what_to_install(fake_qrmi, monkeypatch):
     """The warmup needs qiskit. Say so, and offer the way out."""
-    import builtins
-
-    real = builtins.__import__
-
-    def no_qiskit(name, *a, **k):
-        if name == "qiskit":
-            raise ImportError("no qiskit")
-        return real(name, *a, **k)
+    from flux_quantum.backends import qrmi as qrmimod
 
     b = _acquired(fake_qrmi, ["Queued"])
-    monkeypatch.setattr(builtins, "__import__", no_qiskit)
+    monkeypatch.setattr(qrmimod, "QuantumCircuit", None)
     with pytest.raises(RuntimeError) as e:
         b.wait_for_priority({})
     assert "qrmi[ibm]" in str(e.value)

@@ -7,11 +7,23 @@ IBM_CREDS = {
 
 
 import importlib
+import sys
+import types
+
 import pytest
 
 
 def _selector():
     return importlib.import_module("flux_quantum.selector")
+
+
+def _fake_qrmi(monkeypatch):
+    """Enough of qrmi for the ibm backend to construct."""
+    mod = types.ModuleType("qrmi")
+    mod.QuantumResource = object
+    mod.ResourceType = type("ResourceType", (), {"IBMQiskitRuntimeService": "x"})
+    mod.Payload = mod.TaskStatus = object
+    monkeypatch.setitem(sys.modules, "qrmi", mod)
 
 
 def test_no_usable_vendor_raises(backends_real):
@@ -25,6 +37,7 @@ def test_no_usable_vendor_raises(backends_real):
 def test_select_ibm_when_reachable(fresh, monkeypatch):
     """Credentials alone are not enough. The probe asks QRMI whether the
     resource is reachable, so stub that rather than calling out to IBM."""
+    _fake_qrmi(monkeypatch)
     b = fresh(mock=False, env=IBM_CREDS)
     from flux_quantum.backends.base import Signals
 
@@ -37,6 +50,7 @@ def test_select_ibm_when_reachable(fresh, monkeypatch):
 
 
 def test_unreachable_ibm_is_not_a_candidate(fresh, monkeypatch):
+    _fake_qrmi(monkeypatch)
     b = fresh(mock=False, env=IBM_CREDS)
     from flux_quantum.backends.base import Signals
 

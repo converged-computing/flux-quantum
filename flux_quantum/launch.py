@@ -8,6 +8,12 @@ import os
 
 from flux_quantum import qresource
 
+try:
+    import flux
+    from flux.job import submit
+except ImportError:
+    flux = submit = None
+
 
 def build_scout_jobspec(
     vendor,
@@ -111,9 +117,11 @@ def main():
         print(json.dumps(jobspec, indent=2))
         return
 
-    import flux
-    from flux.job import submit
-
+    if flux is None:
+        raise SystemExit(
+            "quantum-scout-launch: the flux bindings are not importable, run "
+            "under flux python"
+        )
     h = flux.Flux()
     print(submit(h, json.dumps(jobspec)))
 

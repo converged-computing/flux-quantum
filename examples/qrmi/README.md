@@ -33,9 +33,10 @@ Check before you submit anything.
 
     flux python -c "
     from flux_quantum.backends import get_backend
-    print(get_backend('ibm').credentials_present())"
+    print(get_backend('ibm').credential_note)"
 
-That names any variable you are missing. It never prints a value.
+Constructing the backend is the check. It raises naming any variable you are
+missing, and never prints a value.
 
 
 unset FLUX_QUANTUM_MOCK

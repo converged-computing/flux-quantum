@@ -13,10 +13,17 @@ import json
 import signal
 import sys
 
-from flux_quantum.backends import get_backend
+from flux_quantum.backends import BackendError, get_backend
+from flux_quantum.keys import SESSION_KEY  # noqa: F401  (re-exported)
 
-# memo key carrying the session id to the classical job
-SESSION_KEY = "quantum_session"
+# the flux bindings are only importable under flux python. Every flux call
+# takes an injectable so the unit tests can run without them.
+try:
+    import flux
+    from flux.job import JobID, event_wait
+    from flux.job import cancel as flux_cancel
+except ImportError:
+    flux = JobID = event_wait = flux_cancel = None
 
 
 def post_session(handle, jobid, session, rpc=None):
@@ -34,8 +41,7 @@ def post_session(handle, jobid, session, rpc=None):
 
 def wait_for_job(handle, jobid, waiter=None):
     """Block until the job reaches clean."""
-    if waiter is None:
-        from flux.job import event_wait as waiter
+    waiter = waiter or event_wait
     # a failed job still reaches clean, and we close the session either way
     waiter(handle, jobid, "clean", raiseJobException=False)
 
@@ -43,8 +49,7 @@ def wait_for_job(handle, jobid, waiter=None):
 def abort_held(handle, jobid, why, cancel=None):
     """Cancel the held classical and exit, so a failure before the release
     does not leave it parked forever."""
-    if cancel is None:
-        from flux.job import cancel
+    cancel = cancel or flux_cancel
     try:
         cancel(handle, jobid, why)
         print("quantum-scout: cancelled held job {}".format(jobid), file=sys.stderr)
@@ -91,10 +96,10 @@ def main():
     )
     args = ap.parse_args()
 
-    # flux is imported here and not at the top so the unit tests can import
-    # this module without flux installed
-    import flux
-    from flux.job import JobID
+    if flux is None:
+        sys.exit(
+            "quantum-scout: the flux bindings are not importable, run under flux python"
+        )
 
     jobid = int(JobID(args.job))
     h = flux.Flux()
@@ -104,11 +109,16 @@ def main():
     if args.session:
         session = args.session
     else:
-        backend = get_backend(args.vendor)
+        try:
+            backend = get_backend(args.vendor)
+        except BackendError as e:
+            abort_held(h, jobid, str(e))
         if backend is None:
-            sys.exit(
-                "quantum-scout: no backend registered for vendor {}, "
-                "set FLUX_QUANTUM_MOCK for the mock vendor".format(args.vendor)
+            abort_held(
+                h,
+                jobid,
+                "no backend registered for vendor {}, set FLUX_QUANTUM_MOCK for "
+                "the mock vendor".format(args.vendor),
             )
         opts = json.loads(args.options)
         try:
@@ -129,6 +139,9 @@ def main():
             backend.close_session(session)
             abort_held(h, jobid, "{} never became ours: {}".format(args.vendor, why))
         print("quantum-scout: {}".format(why))
+        # what the classical job needs may only exist once the device is
+        # held. Braket publishes its token after the hybrid job starts.
+        session = backend.session_id(session)
 
     # must land before the release, or the job could start with no session
     try:

@@ -9,6 +9,7 @@ import os
 
 from .base import (
     Backend,
+    BackendError,  # noqa: F401
     Signals,
     register,
     get_backend,  # noqa: F401

@@ -26,9 +26,19 @@ def stub_flux_cli(monkeypatch):
     m_p.CLIPlugin = CLIPlugin
     m_flux.cli = m_cli
     m_cli.plugin = m_p
+
+    # cli.py imports submit and cancel at module level. The tests inject
+    # their own, so these only have to exist.
+    def _stub(*a, **k):
+        raise AssertionError("flux.job is a stub in the unit tests")
+
+    m_job = types.ModuleType("flux.job")
+    m_job.submit = m_job.cancel = _stub
+    m_flux.job = m_job
     monkeypatch.setitem(sys.modules, "flux", m_flux)
     monkeypatch.setitem(sys.modules, "flux.cli", m_cli)
     monkeypatch.setitem(sys.modules, "flux.cli.plugin", m_p)
+    monkeypatch.setitem(sys.modules, "flux.job", m_job)
     monkeypatch.setenv("FLUX_QUANTUM_MOCK", "1")
     for name in [m for m in sys.modules if m.startswith("flux_quantum")]:
         del sys.modules[name]

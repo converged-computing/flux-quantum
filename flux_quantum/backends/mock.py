@@ -137,9 +137,6 @@ class MockBackend(Backend):
         self._closed = session
         return
 
-    def credentials_present(self):
-        return True, "mock: no credentials required"
-
     def probe(self):
         q = os.environ.get("FLUX_QUANTUM_MOCK_QUEUE")
         c = os.environ.get("FLUX_QUANTUM_MOCK_COST")
@@ -158,9 +155,6 @@ class MockBusyBackend(Backend):
     def close_session(self, session=None):
         self._closed = session
         return
-
-    def credentials_present(self):
-        return True, "mock_busy: no credentials required"
 
     def probe(self):
         return Signals(available=True, queue_depth=9, cost=5.0, detail={"mock": True})

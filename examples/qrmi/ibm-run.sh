@@ -88,9 +88,7 @@ echo "crn      $IBM_CLOUD_CRN" >> "$OUT/run.txt"
 say "credentials"
 flux python -c "
 from flux_quantum.backends import get_backend
-ok, msg = get_backend('ibm').credentials_present()
-print(msg)
-raise SystemExit(0 if ok else 1)" | tee -a "$OUT/run.txt" || die "credentials incomplete"
+print(get_backend('ibm').credential_note)" | tee -a "$OUT/run.txt" || die "credentials incomplete"
 
 # 3. submit. The classical job prints and exits, so the billed window is warmup plus a few seconds.
 warmup_args="--quantum-ibm-warmup-timeout $WARMUP_TIMEOUT"

@@ -1,3 +1,8 @@
+import sys
+import types
+
+import pytest
+
 IBM_CREDS = {
     "ibm_kingston_QRMI_IBM_QRS_ENDPOINT": "supersecret",
     "ibm_kingston_QRMI_IBM_QRS_IAM_ENDPOINT": "supersecret",
@@ -23,40 +28,59 @@ def test_mock_present_with_env(backends_mock):
     assert {"mock", "mock_busy"} <= backends_mock.known_vendors()
 
 
-def test_missing_creds_reported(backends_real):
-    ok, msg = backends_real.get_backend("ibm").credentials_present()
-    # names the variables it wants, never a value
-    assert not ok and "_QRMI_IBM_QRS_IAM_APIKEY" in msg
+def _fake_qrmi(monkeypatch):
+    """The backend binds qrmi when its module is imported, so the stub has to
+    be in sys.modules before the package is imported fresh."""
+    mod = types.ModuleType("qrmi")
+    mod.QuantumResource = object
+    mod.ResourceType = type("ResourceType", (), {"IBMQiskitRuntimeService": "x"})
+    mod.Payload = mod.TaskStatus = object
+    monkeypatch.setitem(sys.modules, "qrmi", mod)
 
 
-def test_creds_present_when_env_set(fresh):
+def test_missing_creds_fail_at_construction(backends_real):
+    """Constructing the backend is the check. The message names the variables
+    it wants, never a value."""
+    with pytest.raises(backends_real.BackendError) as e:
+        backends_real.get_backend("ibm")
+    assert "_QRMI_IBM_QRS_IAM_APIKEY" in str(e.value)
+
+
+def test_creds_present_when_env_set(fresh, monkeypatch):
+    _fake_qrmi(monkeypatch)
     b = fresh(mock=False, env=IBM_CREDS)
-    ok, msg = b.get_backend("ibm").credentials_present()
-    assert ok and "ibm_kingston" in msg
+    assert "ibm_kingston" in b.get_backend("ibm").credential_note
+
+
+def test_missing_sdk_is_reported_after_credentials(fresh):
+    """With credentials in place but no qrmi, say what to install."""
+    b = fresh(mock=False, env=IBM_CREDS)
+    with pytest.raises(b.BackendError, match="qrmi is not installed"):
+        b.get_backend("ibm")
 
 
 def test_partial_creds_name_only_the_missing_variable(fresh):
     partial = dict(IBM_CREDS)
     del partial["ibm_kingston_QRMI_IBM_QRS_SERVICE_CRN"]
     b = fresh(mock=False, env=partial)
-    ok, msg = b.get_backend("ibm").credentials_present()
-    assert not ok
+    with pytest.raises(b.BackendError) as e:
+        b.get_backend("ibm")
+    msg = str(e.value)
     assert "ibm_kingston_QRMI_IBM_QRS_SERVICE_CRN" in msg
     # the api key value must never be echoed back
     assert "supersecret" not in msg
 
 
 def test_mock_needs_no_creds(backends_mock):
-    ok, _ = backends_mock.get_backend("mock").credentials_present()
-    assert ok
+    assert backends_mock.get_backend("mock") is not None
 
 
-def test_backend_declares_options_and_scout_options_roundtrip():
+def test_backend_declares_options_and_scout_options_roundtrip(fresh, monkeypatch):
     """A vendor backend declares CLI options and extracts them from args."""
-    from flux_quantum.backends import get_backend
-    import flux_quantum.backends.ibm  # ensure ibm registered
+    _fake_qrmi(monkeypatch)
+    b = fresh(mock=False, env=IBM_CREDS)
 
-    ibm = get_backend("ibm")
+    ibm = b.get_backend("ibm")
     declared = []
     ibm.add_options(lambda name, **kw: declared.append(name))
     assert "--ibm-resource" in declared and "--ibm-type" in declared
@@ -70,8 +94,9 @@ def test_backend_declares_options_and_scout_options_roundtrip():
     assert opts["type"] == "qiskit-runtime-service"
 
 
-def test_scout_options_infer_the_resource_from_the_environment(fresh):
+def test_scout_options_infer_the_resource_from_the_environment(fresh, monkeypatch):
     """One resource configured is unambiguous, so the id need not be repeated."""
+    _fake_qrmi(monkeypatch)
     b = fresh(mock=False, env=IBM_CREDS)
 
     class _Args:
@@ -81,9 +106,10 @@ def test_scout_options_infer_the_resource_from_the_environment(fresh):
     assert b.get_backend("ibm").scout_options(_Args())["resource"] == "ibm_kingston"
 
 
-def test_job_environment_follows_the_qrmi_convention(fresh):
+def test_job_environment_follows_the_qrmi_convention(fresh, monkeypatch):
     """The classical job gets the same variables Slurm and LSF set, so user
     code can call get_job_qpu_resources_and_types unchanged."""
+    _fake_qrmi(monkeypatch)
     b = fresh(mock=False, env=IBM_CREDS)
     env = b.get_backend("ibm").job_environment(
         {"resource": "ibm_kingston", "type": "qiskit-runtime-service"}
@@ -105,20 +131,23 @@ def test_mock_open_session_uses_options(monkeypatch):
     assert b.open_session({}).startswith("mock-session-")
 
 
-def test_open_session_without_a_resource_is_explicit():
-    from flux_quantum.backends import get_backend
-    import flux_quantum.backends.ibm  # noqa
+def test_open_session_without_a_resource_is_explicit(fresh, monkeypatch):
+    _fake_qrmi(monkeypatch)
+    b = fresh(mock=False, env=IBM_CREDS)
+    with pytest.raises(ValueError, match="no QRMI resource id"):
+        b.get_backend("ibm").open_session({})
 
-    with __import__("pytest").raises(ValueError, match="no QRMI resource id"):
-        get_backend("ibm").open_session({})
 
-
-def test_open_session_names_the_missing_variable(fresh):
-    partial = dict(IBM_CREDS)
-    del partial["ibm_kingston_QRMI_IBM_QRS_IAM_APIKEY"]
-    b = fresh(mock=False, env=partial)
-    with __import__("pytest").raises(ValueError) as e:
+def test_open_session_names_the_missing_variable(fresh, monkeypatch):
+    """Two resources, one complete. Construction passes on the complete one,
+    and asking for the other names what it lacks."""
+    _fake_qrmi(monkeypatch)
+    env = dict(IBM_CREDS)
+    env["ibm_torino_QRMI_IBM_QRS_ENDPOINT"] = "supersecret"
+    b = fresh(mock=False, env=env)
+    with pytest.raises(ValueError) as e:
         b.get_backend("ibm").open_session(
-            {"resource": "ibm_kingston", "type": "qiskit-runtime-service"}
+            {"resource": "ibm_torino", "type": "qiskit-runtime-service"}
         )
-    assert "ibm_kingston_QRMI_IBM_QRS_IAM_APIKEY" in str(e.value)
+    assert "ibm_torino_QRMI_IBM_QRS_IAM_APIKEY" in str(e.value)
+    assert "supersecret" not in str(e.value)

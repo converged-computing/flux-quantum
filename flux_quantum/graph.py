@@ -17,6 +17,11 @@ import json
 
 from . import qresource
 
+try:
+    from flux.resource import resource_list
+except ImportError:
+    resource_list = None
+
 
 def get_live_graph(handle, criteria="status=up"):
     """Return the live fluxion graph of nodes and edges from the find RPC."""
@@ -54,8 +59,9 @@ def vendors_present(graph):
 
 def allocated_cores(handle, lister=None):
     """Cores the scheduler currently has allocated."""
+    lister = lister or resource_list
     if lister is None:
-        from flux.resource import resource_list as lister
+        raise RuntimeError("the flux bindings are not importable")
     return int(lister(handle).get().allocated.ncores)
 
 

@@ -1,6 +1,12 @@
-import sys
 import importlib
+import os
+import sys
+
 import pytest
+
+# probe_hold lives in tests/, one level up, and pytest only puts the test
+# file's own directory on the path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _fresh(mock, monkeypatch):
