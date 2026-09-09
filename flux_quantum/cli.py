@@ -21,10 +21,11 @@ import sys
 
 import flux
 from flux.cli.plugin import CLIPlugin
+from flux.job import cancel, submit
 
 from . import graph, qresource
 from .selector import select_vendor, SelectionError, discover_registry_vendors
-from .backends import get_backend, backend_classes
+from .backends import BackendError, get_backend, backend_classes
 from .launch import build_scout_jobspec
 
 # subcommands where quantum submission makes sense
@@ -115,12 +116,8 @@ def prepare_pair(
     flux submits whatever is left in the jobspec, so it submits the scout.
     The flux calls are injectable so this is testable without a broker.
     """
-    # flux.job is imported here and not at the top so the unit tests can drive
-    # this without flux installed
-    if submit_fn is None:
-        from flux.job import submit as submit_fn
-    if cancel_fn is None:
-        from flux.job import cancel as cancel_fn
+    submit_fn = submit_fn or submit
+    cancel_fn = cancel_fn or cancel
     populate_fn = populate_fn or graph.populate
     get_graph_fn = get_graph_fn or graph.get_live_graph
     if wrap_path is None:
@@ -302,7 +299,10 @@ class QuantumCLIPlugin(CLIPlugin):
         if not vendor:
             return  # not a quantum submit
 
-        backend = get_backend(vendor)
+        try:
+            backend = get_backend(vendor)
+        except BackendError as e:
+            raise SystemExit("flux quantum: {}".format(e))
         options = backend.scout_options(args) if backend else {}
         job_env = backend.job_environment(options) if backend else {}
         handle = flux.Flux()
@@ -322,9 +322,9 @@ class QuantumCLIPlugin(CLIPlugin):
             vendor = jobspec.getattr("system.quantum.vendor")
         except KeyError:
             return  # not a quantum job
-        backend = get_backend(vendor)
+        try:
+            backend = get_backend(vendor)
+        except BackendError as e:
+            raise ValueError(str(e))
         if backend is None:
             raise ValueError("quantum: no backend for vendor '{}'".format(vendor))
-        ok, msg = backend.credentials_present()
-        if not ok:
-            raise ValueError(msg)

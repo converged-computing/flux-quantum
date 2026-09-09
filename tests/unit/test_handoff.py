@@ -91,9 +91,6 @@ def test_backend_close_session_defaults_to_noop():
     class _Bare(Backend):
         name = "bare"
 
-        def credentials_present(self):
-            return True, "ok"
-
         def probe(self):
             return None
 

@@ -11,7 +11,7 @@ the selector works with or without a flux handle.
 import json
 
 from . import qresource
-from .backends import get_backend, known_vendors
+from .backends import BackendError, get_backend, known_vendors
 
 
 class SelectionError(Exception):
@@ -43,13 +43,13 @@ def select_vendor(candidates=None, policy=None):
     usable = []
     log = []
     for name in names:
-        backend = get_backend(name)
+        try:
+            backend = get_backend(name)
+        except BackendError as e:  # no SDK or no credentials, said in e
+            log.append(str(e))
+            continue
         if backend is None:
             log.append("{}: no backend registered".format(name))
-            continue
-        ok, msg = backend.credentials_present()
-        if not ok:
-            log.append(msg)
             continue
         try:
             sig = backend.probe()

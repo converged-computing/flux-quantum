@@ -4,10 +4,19 @@ A backend supplies the live signals the fluxion graph cannot, meaning queue
 depth, cost and availability, and it owns the vendor session. Backends run in
 userspace with the user credentials, both in the CLI plugin and in the scout.
 
+Constructing a backend is the credential check. A backend whose SDK is not
+installed or whose credentials cannot be found raises BackendError from
+__init__, so nothing downstream ever holds an unusable backend.
+
 Adding a vendor means adding a Backend subclass and registering it.
 """
 
 from abc import ABC, abstractmethod
+
+
+class BackendError(RuntimeError):
+    """The backend cannot be used. The message names what is missing, never
+    a credential value."""
 
 
 class Signals:
@@ -31,6 +40,9 @@ class Backend(ABC):
     # vendor key like ibm, must match the qdevice_<name> graph type
     name = None
 
+    # set by __init__ to say where the credentials came from, for the log
+    credential_note = ""
+
     @classmethod
     def add_options(cls, add_option):
         """Declare the flux submit options for this vendor.
@@ -41,11 +53,7 @@ class Backend(ABC):
         return
 
     def scout_options(self, args):
-        """Return the options for this vendor from the parsed args.
-
-        Only the selected vendor gets collected, so reading another vendor
-        args here is harmless.
-        """
+        """Return the options for this vendor from the parsed args."""
         return {}
 
     def open_session(self, options):
@@ -58,8 +66,7 @@ class Backend(ABC):
         )
 
     def job_environment(self, options):
-        """Env vars to add to the classical job, for example to tell it which
-        QPU it has. Defaults to none."""
+        """Env vars to add to the classical job, for example which QPU it has."""
         return {}
 
     def wait_for_priority(self, options=None):
@@ -67,36 +74,20 @@ class Backend(ABC):
 
         Opening a session is not the same as having the device. IBM activates a
         session when its first task reaches the head of the queue, and Braket
-        reports a queue position and never holds anything. So this is a separate
-        step from open_session, and the scout does not release the classical job
-        until it returns ok.
-
-        Defaults to ready, for vendors with no queue to wait on.
+        reports a queue position and never holds anything. The scout does not
+        release the classical job until this returns ok.
         """
         return True, "not applicable"
 
     def close_session(self, session=None):
-        """Release the session opened by open_session.
-
-        Called in the scout after the classical job finishes. A backend holding
-        vendor state, like a QRMI lock, stashes it on self and releases it
-        here. Defaults to doing nothing for vendors with nothing to release.
-        """
+        """Release the session opened by open_session. Called in the scout
+        after the classical job finishes."""
         return
 
     @abstractmethod
-    def credentials_present(self):
-        """Return ok and a message, where ok is False if credentials are
-        missing. Never returns or logs the secret itself.
-        """
-
-    @abstractmethod
     def probe(self):
-        """Return Signals for this vendor.
-
-        Only called once credentials_present is ok. May raise. The selector
-        drops a backend that raises or is unavailable.
-        """
+        """Return Signals for this vendor. May raise. The selector drops a
+        backend that raises or is unavailable."""
 
 
 _REGISTRY = {}
@@ -111,7 +102,10 @@ def register(cls):
 
 
 def get_backend(name):
-    """Return an instantiated backend for a vendor, or None if unknown."""
+    """Return a backend for a vendor, or None if the name is unknown.
+
+    Raises BackendError when the vendor is known but cannot be used.
+    """
     cls = _REGISTRY.get(name)
     return cls() if cls else None
 

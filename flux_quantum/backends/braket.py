@@ -3,21 +3,25 @@
 Braket has no session to acquire. You submit a task, it waits in the device
 queue, and it runs. So the scout submits a trivial no-op task and waits for it
 to reach the front of the queue, which is as close to priority as Braket
-offers.
+offers. Reaching the front reserves nothing, so another user can take the
+device between our task running and the classical job starting. That is the
+vendor's limitation, not ours.
 
-Note the limitation, because it is the vendor's and not ours. Reaching the
-front of the queue does not reserve anything, so another user can take the
-device between our task running and the classical job starting. IBM sessions do
-hold the device, at the price of billing wall clock for it. Braket exposes the
-queue position but no way to hold it.
-
-The SDK is an optional dependency, so it is imported inside the methods.
+The SDK is optional. The module imports without it and the backend refuses to
+construct.
 """
 
 import os
 import time
 
-from .base import Backend, Signals, register
+from .base import Backend, BackendError, Signals, register
+
+try:
+    import boto3
+    from braket.aws import AwsDevice
+    from braket.circuits import Circuit
+except ImportError:
+    boto3 = AwsDevice = Circuit = None
 
 # state simulator, no queue to speak of and cents per task
 SV1 = "arn:aws:braket:::device/quantum-simulator/amazon/sv1"
@@ -60,6 +64,29 @@ class BraketBackend(Backend):
     name = "braket"
 
     def __init__(self):
+        if boto3 is None or AwsDevice is None:
+            raise BackendError(
+                "braket: amazon-braket-sdk is not installed, "
+                "pip install amazon-braket-sdk"
+            )
+        # resolve credentials the way boto3 normally would, and fail here
+        # rather than at the first API call
+        self._credentials = boto3.Session().get_credentials()
+        if self._credentials is None:
+            raise BackendError(
+                "braket: no AWS credentials. Set AWS_ACCESS_KEY_ID and "
+                "AWS_SECRET_ACCESS_KEY, or configure ~/.aws/credentials"
+            )
+        method = getattr(self._credentials, "method", "unknown")
+        if method in ("iam-role", "instance-metadata"):
+            # the instance role belongs to the node and not to the user
+            self.credential_note = (
+                "braket: using the EC2 instance role, which belongs to the "
+                "node and not to you. Export your own keys to keep the "
+                "credential in user space"
+            )
+        else:
+            self.credential_note = "braket: credentials present via {}".format(method)
         self._task = None
 
     @classmethod
@@ -124,9 +151,6 @@ class BraketBackend(Backend):
     def open_session(self, options):
         """Submit the probe task and return its ARN, which is what the
         classical job is handed. The scout calls wait_for_priority next."""
-        from braket.aws import AwsDevice
-        from braket.circuits import Circuit
-
         device_arn = options.get("device") or SV1
         region = options.get("region") or region_for(device_arn)
         os.environ.setdefault("AWS_DEFAULT_REGION", region)
@@ -142,9 +166,8 @@ class BraketBackend(Backend):
 
         Ready at the requested position or closer, and also once the task is
         RUNNING or COMPLETED, because a task that left the queue reports no
-        position and the value we wait for can never arrive. FAILED and
-        CANCELLED are a failure and not readiness, so the caller can cancel the
-        classical job rather than start it against nothing.
+        position. FAILED and CANCELLED are a failure and not readiness, so the
+        caller cancels the classical job rather than starting it.
 
         Returns (ok, reason).
         """
@@ -159,8 +182,6 @@ class BraketBackend(Backend):
             if state in RAN:
                 return True, state
             pos = self.queue_position()
-            # positions over 2000 come back as the string >2000, so compare as
-            # a string rather than an int
             if position_at_most(pos, position):
                 return True, "queue position {}".format(pos)
             print("braket: queued at position {}".format(pos), flush=True)
@@ -181,40 +202,9 @@ class BraketBackend(Backend):
         """Nothing to release. The probe task finishes or is already terminal."""
         return
 
-    def credentials_present(self):
-        """Ask boto3 to resolve credentials the normal way, and say where they
-        came from. An EC2 instance role works but belongs to the node rather
-        than to you, so it is called out."""
-        try:
-            import boto3
-        except ImportError:
-            return (
-                False,
-                "braket: boto3 is not installed, pip install amazon-braket-sdk",
-            )
-        creds = boto3.Session().get_credentials()
-        if creds is None:
-            return False, (
-                "braket: no AWS credentials. Set AWS_ACCESS_KEY_ID and "
-                "AWS_SECRET_ACCESS_KEY, or configure ~/.aws/credentials"
-            )
-        method = getattr(creds, "method", "unknown")
-        if method in ("iam-role", "instance-metadata"):
-            return True, (
-                "braket: using the EC2 instance role, which belongs to the node "
-                "and not to you. Export your own keys to keep the credential in "
-                "user space"
-            )
-        return True, "braket: credentials present via {}".format(method)
-
     def probe(self):
         """Report the device status. Cheap, it is a metadata call."""
-        ok, _ = self.credentials_present()
-        if not ok:
-            return Signals(available=False)
         try:
-            from braket.aws import AwsDevice
-
             device = AwsDevice(SV1)
             return Signals(available=device.status == "ONLINE", detail={"device": SV1})
         except Exception as e:

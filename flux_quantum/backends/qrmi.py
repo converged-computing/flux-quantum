@@ -12,15 +12,26 @@ prefixed with the resource id, so the api key for ibm_kingston is
 Credentials stay in the user environment. We only ever check that a variable is
 set and report its name, never its value.
 
-qrmi is an optional dependency and needs python 3.11 or newer, so it is
-imported inside the methods that use it.
+qrmi is optional and needs python 3.11 or newer. The module imports without
+it and the backend refuses to construct.
 """
 
 import json
 import os
 import time
 
-from .base import Backend, Signals
+from .base import Backend, BackendError, Signals
+
+try:
+    from qrmi import Payload, QuantumResource, ResourceType, TaskStatus
+except ImportError:
+    Payload = QuantumResource = ResourceType = TaskStatus = None
+
+# only the warmup task needs qiskit
+try:
+    from qiskit import QuantumCircuit, qasm3
+except ImportError:
+    QuantumCircuit = qasm3 = None
 
 # type strings QRMI itself uses in qrmi_config.json and in QRMI_JOB_QPU_TYPES,
 # mapped to the ResourceType attribute
@@ -61,8 +72,8 @@ REQUIRED_ENV = {
 
 def resource_type(name):
     """Return the QRMI ResourceType for a type string like ibm-quantum-system."""
-    from qrmi import ResourceType
-
+    if ResourceType is None:
+        raise BackendError("qrmi is not installed, pip install 'qrmi[ibm]'")
     attr = RESOURCE_TYPES.get(name, name)
     if not hasattr(ResourceType, attr):
         known = ", ".join(sorted(RESOURCE_TYPES))
@@ -90,10 +101,7 @@ def missing_env(resource, rtype):
     return [s for s in REQUIRED_ENV.get(rtype, ()) if not os.environ.get(resource + s)]
 
 
-# QRMI passes the acquisition token to the job in this variable, prefixed with
-# the resource id. The Slurm and LSF plugins set it, so we set it too and a
-# workload written for either runs here unchanged.
-ACQUISITION_TOKEN = "_QRMI_JOB_ACQUISITION_TOKEN"
+from ..keys import ACQUISITION_TOKEN  # noqa: E402,F401
 
 
 def warmup_payload(shots=1):
@@ -103,9 +111,7 @@ def warmup_payload(shots=1):
     qiskit generates the qasm3 so we are not hand writing a circuit. A measure
     only circuit needs no basis gate translation, so it is ISA valid anywhere.
     """
-    try:
-        from qiskit import QuantumCircuit, qasm3
-    except ImportError:
+    if QuantumCircuit is None:
         raise RuntimeError(
             "qiskit is needed to build the warmup task. Install it with "
             "pip install 'qrmi[ibm]', or pass --quantum-ibm-skip-warmup to "
@@ -168,6 +174,36 @@ class QRMIBackend(Backend):
     default_type = None
 
     def __init__(self):
+        # The resource id is only known once the submit options are parsed,
+        # so this checks that at least one resource of the default type is
+        # fully configured. open_session checks the one actually chosen.
+        found = resources_in_environment(self.default_type)
+        if not found:
+            wanted = ", ".join(
+                "<resource>" + s for s in REQUIRED_ENV.get(self.default_type, ())
+            )
+            raise BackendError(
+                "{}: no QRMI credentials in the environment, set {}".format(
+                    self.name, wanted
+                )
+            )
+        incomplete = {r: missing_env(r, self.default_type) for r in found}
+        usable = [r for r, m in incomplete.items() if not m]
+        if not usable:
+            r = found[0]
+            raise BackendError(
+                "{}: {} is missing {}".format(
+                    self.name, r, ", ".join(r + s for s in incomplete[r])
+                )
+            )
+        self.credential_note = "{}: credentials present for {}".format(
+            self.name, " ".join(usable)
+        )
+        if QuantumResource is None:
+            raise BackendError(
+                "{}: qrmi is not installed, pip install 'qrmi[ibm]' "
+                "(needs python 3.11 or newer)".format(self.name)
+            )
         self._resource = None
         self._lock = None
 
@@ -256,10 +292,6 @@ class QRMIBackend(Backend):
                     self.name, resource, ", ".join(resource + s for s in missing)
                 )
             )
-        # deferred so a missing resource or variable is reported as a
-        # ValueError above even when qrmi itself is not installed
-        from qrmi import QuantumResource
-
         self._resource = QuantumResource(resource, resource_type(rtype))
         try:
             self._lock = self._resource.acquire()
@@ -317,8 +349,6 @@ class QRMIBackend(Backend):
         Returns (ok, reason). A timeout of 0 waits as long as the scout job is
         allowed to live.
         """
-        from qrmi import Payload, TaskStatus
-
         options = options or {}
         if options.get("skip_warmup"):
             return True, "warmup skipped, priority unconfirmed"
@@ -348,26 +378,6 @@ class QRMIBackend(Backend):
         self._resource = None
         self._lock = None
 
-    def credentials_present(self):
-        found = resources_in_environment(self.default_type)
-        if not found:
-            wanted = ", ".join(
-                "<resource>" + s for s in REQUIRED_ENV.get(self.default_type, ())
-            )
-            return False, "{}: no QRMI credentials in the environment, set {}".format(
-                self.name, wanted
-            )
-        incomplete = {r: missing_env(r, self.default_type) for r in found}
-        usable = [r for r, m in incomplete.items() if not m]
-        if not usable:
-            r = found[0]
-            return False, "{}: {} is missing {}".format(
-                self.name, r, ", ".join(r + s for s in incomplete[r])
-            )
-        return True, "{}: credentials present for {}".format(
-            self.name, " ".join(usable)
-        )
-
     def probe(self):
         """Ask QRMI whether the resource is reachable.
 
@@ -383,8 +393,6 @@ class QRMIBackend(Backend):
         if len(found) != 1:
             return Signals(available=bool(found), detail={"resources": found})
         try:
-            from qrmi import QuantumResource
-
             qr = QuantumResource(found[0], resource_type(self.default_type))
             return Signals(
                 available=bool(qr.is_accessible()), detail={"resource": found[0]}

@@ -55,20 +55,57 @@ def fake_braket(monkeypatch):
 
     circuits.Circuit = FakeCircuit
     pkg = types.ModuleType("braket")
+
+    # the backend resolves credentials through boto3 when it is constructed
+    class FakeSession:
+        def get_credentials(self):
+            return types.SimpleNamespace(method="env")
+
+    boto3 = types.ModuleType("boto3")
+    boto3.Session = FakeSession
     monkeypatch.setitem(sys.modules, "braket", pkg)
     monkeypatch.setitem(sys.modules, "braket.aws", aws)
     monkeypatch.setitem(sys.modules, "braket.circuits", circuits)
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    # the SDK is bound when the backend module is imported, so import it again
+    for name in [m for m in sys.modules if m.startswith("flux_quantum")]:
+        del sys.modules[name]
     return submitted
 
 
 def _backend():
     from flux_quantum.backends import get_backend
-    import flux_quantum.backends.braket  # noqa
 
     return get_backend("braket")
 
 
-def test_defaults_to_the_sv1_simulator():
+def test_missing_sdk_fails_at_construction(monkeypatch):
+    """No SDK, no backend. The message says what to install."""
+    monkeypatch.setitem(sys.modules, "boto3", None)
+    monkeypatch.setitem(sys.modules, "braket", None)
+    for name in [m for m in sys.modules if m.startswith("flux_quantum")]:
+        del sys.modules[name]
+    from flux_quantum.backends import BackendError, get_backend
+
+    with pytest.raises(BackendError, match="amazon-braket-sdk"):
+        get_backend("braket")
+
+
+def test_missing_credentials_fail_at_construction(fake_braket, monkeypatch):
+    import boto3
+
+    monkeypatch.setattr(boto3.Session, "get_credentials", lambda self: None)
+    from flux_quantum.backends import BackendError
+
+    with pytest.raises(BackendError, match="no AWS credentials"):
+        _backend()
+
+
+def test_credential_note_says_where_they_came_from(fake_braket):
+    assert "via env" in _backend().credential_note
+
+
+def test_defaults_to_the_sv1_simulator(fake_braket):
     """SV1 is cents per task, so it is the sane default for a probe."""
     from flux_quantum.backends.braket import SV1
 
