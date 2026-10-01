@@ -1,24 +1,44 @@
 #!/usr/bin/env python3
-"""Does a hybrid job token give priority to work submitted elsewhere.
+"""Does a hybrid job token give priority to work submitted from outside.
 
 That is what this branch turns on. If the token travels, the hybrid job is the
 scout and the classical work stays on our cluster. If not, the job has to
 submit for us, which is a different design.
 
+The measurement is a race the token task has to win from behind.
+
+    open the hold, a hybrid job that does nothing but publish its token
+    submit a control task without the token
+    submit the token task after it, so it is behind the control
+    watch both until the token task finishes, with the hold still up
+
+Two things say whether the token bought anything. Braket reports which queue
+a task is waiting in, Normal or Priority, and its position there, but only
+when GetQuantumTask is asked for QueueInfo. Earlier runs never asked, so
+they saw nothing and fell back to the device counters, which lag a submit by
+minutes. Then the service timestamps say whether the token task finished
+ahead of a control that was submitted before it. Both are read straight from
+the tasks, so neither depends on the counters.
+
 Run against SV1 first. A simulator runs tasks straight away so this says
 nothing about ordering, but it does say whether the API takes the token from
 outside the container and links the task to the job. That costs a few cents.
-Then run it against a QPU, where queuePriority is the direct answer.
+Then run it against a QPU that has a queue, where the queue is the answer.
 
-    python3 probe_hold.py                    # SV1
-    python3 probe_hold.py --device arn:...   # a real QPU, costs money
+    python3 tests/probe_hold.py --survey                # who has a queue
+    python3 tests/probe_hold.py                         # SV1
+    python3 tests/probe_hold.py --device arn:... --shots 100 --max-seconds 1800
 
-The hold is closed in a finally, so nothing is left running.
+--max-seconds is the hold, and the token task has to finish inside it. On a
+device where each task takes minutes, give it half an hour. The hold is
+closed in a finally, so nothing is left running.
 """
 
 import argparse
 import datetime
 import json
+import os
+import sys
 import time
 import uuid
 
@@ -28,8 +48,10 @@ from braket.aws import AwsSession
 from flux_quantum.backends.braket import (
     SV1,
     BraketBackend,
+    cost,
     is_open,
     queue_depth,
+    region_for,
     shots_range,
     survey,
     windows,
@@ -43,8 +65,77 @@ h q[0];
 c[0] = measure q[0];
 """
 
+TERMINAL = ("COMPLETED", "FAILED", "CANCELLED")
 
-def submit(braket, device, bucket, token=None, shots=1):
+
+def qasm_action():
+    """The one qubit circuit as a task action."""
+    return json.dumps(
+        {
+            "braketSchemaHeader": {
+                "name": "braket.ir.openqasm.program",
+                "version": "1",
+            },
+            "source": BELL,
+        }
+    )
+
+
+def ahs_program():
+    """The smallest analog program Aquila will take.
+
+    Aquila runs Hamiltonians, not circuits, so a circuit is refused. One
+    atom, one microsecond, every field held at zero. Built with the SDK so
+    the schema is the SDK's and not ours.
+    """
+    from braket.ahs.analog_hamiltonian_simulation import AnalogHamiltonianSimulation
+    from braket.ahs.atom_arrangement import AtomArrangement
+    from braket.ahs.driving_field import DrivingField
+    from braket.timings.time_series import TimeSeries
+
+    zero = TimeSeries().put(0.0, 0.0).put(1e-6, 0.0)
+    return AnalogHamiltonianSimulation(
+        register=AtomArrangement().add((0.0, 0.0)),
+        hamiltonian=DrivingField(amplitude=zero, phase=zero, detuning=zero),
+    )
+
+
+def ahs_action():
+    ir = ahs_program().to_ir()
+    dump = getattr(ir, "model_dump_json", None) or ir.json
+    return dump()
+
+
+def program_action(device):
+    """The task action for this device: analog for QuEra, a circuit otherwise."""
+    if "/quera/" in device:
+        return ahs_action()
+    return qasm_action()
+
+
+def check_program(device):
+    """Run the program on the local simulator, which validates it for free.
+
+    The analog simulator checks the program against Aquila's own limits
+    before it simulates, so a program it accepts is one Aquila accepts, and
+    a program it refuses would have been refused after the hold was up.
+    """
+    from braket.devices import LocalSimulator
+
+    if "/quera/" in device:
+        LocalSimulator("braket_ahs").run(ahs_program(), shots=1).result()
+    else:
+        from braket.ir.openqasm import Program
+
+        LocalSimulator().run(Program(source=BELL), shots=1).result()
+
+
+# the ml.m5.large the hold runs on, per hour. Braket bills the instance by
+# the minute and nothing else for a job that submits no tasks of its own
+HOLD_PER_HOUR = 0.115
+
+
+def submit(braket, device, bucket, token=None, shots=1, action=None):
     """Create a task, with or without the token.
 
     Without it the docs say the task gets no priority and bills standalone.
@@ -56,75 +147,142 @@ def submit(braket, device, bucket, token=None, shots=1):
         "shots": shots,
         "outputS3Bucket": bucket,
         "outputS3KeyPrefix": "flux-quantum-probe",
-        "action": json.dumps(
-            {
-                "braketSchemaHeader": {
-                    "name": "braket.ir.openqasm.program",
-                    "version": "1",
-                },
-                "source": BELL,
-            }
-        ),
+        "action": action or program_action(device),
     }
     if token:
         args["jobToken"] = token
     return braket.create_quantum_task(**args)["quantumTaskArn"]
 
 
-TERMINAL = ("COMPLETED", "FAILED", "CANCELLED")
-
-
 def describe(braket, arn):
-    """What the service says about the task."""
-    t = braket.get_quantum_task(quantumTaskArn=arn)
+    """What the service says about the task, queue included.
+
+    queueInfo only comes back when the call asks for it. Without
+    additionalAttributeNames the response has no queue, no position and no
+    queuePriority, which is what every run before this one saw.
+    """
+    t = braket.get_quantum_task(
+        quantumTaskArn=arn, additionalAttributeNames=["QueueInfo"]
+    )
     q = t.get("queueInfo") or {}
+    position = q.get("position")
+    if position in ("None", ""):
+        position = None
     return {
         "status": t.get("status"),
         "job": t.get("jobArn"),
         "queue": q.get("queue"),
-        "position": q.get("position"),
+        "position": position,
         "priority": q.get("queuePriority"),
+        "message": q.get("message"),
+        "created": t.get("createdAt"),
+        "ended": t.get("endedAt"),
     }
 
 
-def settle(braket, arns, timeout=180, interval=1.0, sleep=time.sleep):
-    """Follow both tasks to the end, keeping the best view of each.
+def _stamp(now):
+    return datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
 
-    jobArn is set when the task is created and is still there afterwards, so
-    the verdict never has to catch anything in flight. queueInfo is the
-    opposite. It describes a task that is still waiting and is gone once it
-    runs, so we record it if we see it and never wait for it. A one qubit task
-    on a simulator can finish before the first poll returns.
+
+def follow(
+    braket,
+    arns,
+    timeout=1800,
+    interval=5.0,
+    sleep=time.sleep,
+    clock=time.time,
+    done=None,
+    views=None,
+    say=None,
+    heartbeat=60,
+):
+    """Poll the tasks until done says so, keeping what each one showed.
+
+    The queue fields describe a task that is waiting and are gone once it
+    runs, so the first sighting of each is kept as the task's queue, and the
+    timeline records every change so the run can be read back later. A one
+    qubit task on a simulator can finish before the first poll returns, and
+    then there is simply no queue entry, which the verdict allows for.
+
+    done takes the views and says whether to stop. The default is every task
+    terminal. Pass views back in to keep following after a stop.
     """
-    best = {a: {} for a in arns}
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        pending = False
+    if done is None:
+
+        def done(v):
+            return all(v[a].get("status") in TERMINAL for a in arns)
+
+    views = views if views is not None else {}
+    for a in arns:
+        views.setdefault(a, {"timeline": []})
+    deadline = clock() + timeout
+    started = last_word = clock()
+    while True:
+        now = clock()
         for a in arns:
+            v = views[a]
+            if v.get("status") in TERMINAL:
+                continue
             seen = describe(braket, a)
-            for k, v in seen.items():
-                # keep the first real value we see
-                if v and not best[a].get(k):
-                    best[a][k] = v
-            best[a]["status"] = seen["status"]
-            if seen["status"] not in TERMINAL:
-                pending = True
-        if not pending:
-            break
+            for k in ("job", "created", "ended", "queue", "message"):
+                if seen.get(k) and not v.get(k):
+                    v[k] = seen[k]
+            # which queue the task waited in, and where it started
+            if seen["priority"] and not v.get("priority"):
+                v["priority"] = seen["priority"]
+                v["position"] = seen["position"]
+            if seen["position"]:
+                v["position_last"] = seen["position"]
+            v["status"] = seen["status"]
+            change = (seen["status"], seen["priority"], seen["position"])
+            if not v["timeline"] or v["timeline"][-1][1:] != list(change):
+                v["timeline"].append([_stamp(now), *change])
+                if say:
+                    say(a, seen)
+                    last_word = now
+        if done(views) or clock() + interval > deadline:
+            return views
+        # a device that takes minutes per task prints nothing for minutes,
+        # which looks like a hang. Say we are still here, and what we see
+        if say and heartbeat and now - last_word >= heartbeat:
+            print(
+                "  still waiting after %.0fs, %s"
+                % (
+                    now - started,
+                    ", ".join(
+                        "%s %s%s"
+                        % (
+                            a.split("/")[-1][:8],
+                            views[a].get("status"),
+                            (
+                                " at %s" % views[a]["position_last"]
+                                if views[a].get("position_last")
+                                else ""
+                            ),
+                        )
+                        for a in arns
+                    ),
+                ),
+                flush=True,
+            )
+            last_word = now
         sleep(interval)
-    return best
+
+
+def seconds_between(earlier, later):
+    """later minus earlier in seconds, or None if either is missing."""
+    if not earlier or not later:
+        return None
+    return (later - earlier).total_seconds()
 
 
 def make_queue(braket, device, bucket, count, shots=1):
     """Submit filler tasks so there is a queue to jump.
 
-    A device is only busy while it is shut, and drains as soon as a window
-    opens, so waiting for someone else's backlog means waiting for a window to
-    open with work still in front of it. Making our own removes that.
-
-    These go in without a token so they sit in the Normal queue, and they go
-    in after the hold is ready, because a fast device empties during the two
-    minutes the hold takes to provision.
+    A device that is idle runs the control and the token task at once and
+    shows nothing. These go in without a token so they sit in Normal, and
+    they go in after the hold is ready, because a fast device empties during
+    the two minutes the hold takes to provision.
 
     They cost the task fee each, so keep the count small.
     """
@@ -135,7 +293,7 @@ def make_queue(braket, device, bucket, count, shots=1):
 
 
 def drain_queue(braket, arns):
-    """Cancel the filler, so it does not run and bill for shots.
+    """Cancel what is still waiting, so it does not run and bill for shots.
 
     A task that has already started cannot be cancelled, which is fine. The
     task fee is spent either way, the shots are what this saves.
@@ -149,23 +307,6 @@ def drain_queue(braket, arns):
             # on a fast device and not worth a wall of text
             if "COMPLETED" not in str(e):
                 print("could not cancel %s: %s" % (a.split("/")[-1], e))
-
-
-def wait_for_queue(device, timeout=20, interval=0.5, sleep=time.sleep):
-    """Wait until the filler actually shows up in the Normal queue.
-
-    Submitting returns before the service counts the task, and on a fast
-    device the window between counted and finished is short. Reading the
-    depth straight after the submit can miss it in either direction.
-    """
-    deadline = time.time() + timeout
-    last = queue_depth(device)
-    while time.time() < deadline:
-        if last["normal"] > 0:
-            return last
-        sleep(interval)
-        last = queue_depth(device)
-    return last
 
 
 def calibration(device):
@@ -239,6 +380,41 @@ def used_qubits(braket_task_arn):
         return {"error": str(e)}
 
 
+class Tee:
+    """Everything printed goes to the terminal and to a file.
+
+    A terminal that is closed takes the run with it. The backend prints its
+    progress too, and a traceback goes to stderr, so both streams are teed.
+    """
+
+    def __init__(self, path, stream):
+        self.fh = open(path, "a")
+        self.stream = stream
+
+    def write(self, s):
+        self.stream.write(s)
+        self.fh.write(s)
+        self.fh.flush()
+        return len(s)
+
+    def flush(self):
+        self.stream.flush()
+        self.fh.flush()
+
+
+def log_to(path, argv=None):
+    """Tee stdout and stderr to path, and write a header naming the run."""
+    sys.stdout = Tee(path, sys.stdout)
+    sys.stderr = Tee(path, sys.stderr)
+    print(
+        "\n=== %s  %s"
+        % (
+            datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            " ".join(argv if argv is not None else sys.argv),
+        )
+    )
+
+
 def record(path, row):
     """One JSON line per run.
 
@@ -252,32 +428,94 @@ def record(path, row):
         fh.write(_json.dumps(row, default=str) + "\n")
 
 
-def settled_depth(device, timeout=30, interval=2.0, sleep=time.sleep):
-    """Read the queue once it has stopped moving.
+def inspect(braket, arns):
+    """What the service says about tasks from earlier runs. Free.
 
-    The counters lag submission by a few seconds. Reading straight after a
-    submit gave normal=1 right after six filler tasks went in, then 7 a
-    moment later, so a token task's arrival in Priority was attributed to the
-    filler catching up. Wait for two readings in a row to agree.
+    createdAt and endedAt give how long a device took to serve a task, which
+    is what decides whether a queue on it is real. The queue label survives
+    completion, so the Priority against Normal reading is still there too.
     """
-    last = queue_depth(device)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        sleep(interval)
-        now = queue_depth(device)
-        if all(now.get(k) == last.get(k) for k in ("normal", "priority")):
-            return now
-        last = now
-    return last
+    rows = [describe(braket, a) for a in arns]
+    print(
+        "  %-14s %-10s %-9s %-26s %-26s %s"
+        % ("task", "status", "queue", "created", "ended", "took")
+    )
+    for a, r in zip(arns, rows):
+        took = seconds_between(r.get("created"), r.get("ended"))
+        print(
+            "  %-14s %-10s %-9s %-26s %-26s %s"
+            % (
+                a.split("/")[-1][:12],
+                r.get("status"),
+                r.get("priority") or "-",
+                r.get("created") or "-",
+                r.get("ended") or "-",
+                "-" if took is None else "%.0fs" % took,
+            )
+        )
+    return rows
 
 
-def moved(before, after):
-    """Which queue grew between two readings."""
-    return {
-        k: after.get(k, 0) - v
-        for k, v in before.items()
-        if isinstance(v, int) and isinstance(after.get(k), int)
-    }
+def pace(braket, device, bucket, count, shots, timeout=600, **kw):
+    """How fast a device serves plain tasks, with no hold and no token.
+
+    Whether filler can build a queue depends on this alone. Cepheus served
+    eight tasks in under a second, Forte held two for six minutes. Tasks go
+    in back to back and each is followed to its end, and the report says
+    how long each took and whether they ran one after another or all at
+    once. Costs the task fee and shots each, nothing else.
+    """
+    arns = make_queue(braket, device, bucket, count, shots)
+    views = follow(braket, arns, timeout=timeout, **kw)
+    rows = []
+    for a in arns:
+        v = views[a]
+        rows.append(
+            {
+                "arn": a,
+                "status": v.get("status"),
+                "created": v.get("created"),
+                "ended": v.get("ended"),
+                "took": seconds_between(v.get("created"), v.get("ended")),
+                "position": v.get("position"),
+            }
+        )
+    return rows
+
+
+def pace_report(rows):
+    """Serial or not, and how long each task took."""
+    out = []
+    for r in rows:
+        out.append(
+            "  %-14s %-10s queued at %-5s took %s"
+            % (
+                r["arn"].split("/")[-1][:12],
+                r["status"],
+                r["position"] or "-",
+                "-" if r["took"] is None else "%.1fs" % r["took"],
+            )
+        )
+    done = [r for r in rows if r["created"] and r["ended"]]
+    if len(done) >= 2:
+        # created to ended includes the wait, so it says nothing on its own.
+        # The gap between one finish and the next is the service time, and
+        # a queue is only visible when that is longer than a poll
+        ends = sorted(r["ended"] for r in done)
+        gaps = [seconds_between(a, b) for a, b in zip(ends, ends[1:])]
+        if min(gaps) >= 5:
+            out.append(
+                "SERIAL. %d tasks finished %.0fs apart at the least, about "
+                "%.0fs each, so filler will hold this device."
+                % (len(done), min(gaps), sum(gaps) / len(gaps))
+            )
+        else:
+            out.append(
+                "OVERLAPPING. %d tasks finished within %.1fs of each other, so "
+                "this device runs them together or in under a poll, and "
+                "filler will not build a queue here." % (len(done), min(gaps))
+            )
+    return out
 
 
 def _tzname():
@@ -327,16 +565,28 @@ def show_survey(shots=1):
             )
 
 
-def verdict(
-    with_token, without, device, by_token=None, by_control=None, after_token=None
-):
+def _where(view):
+    """A task's queue and position as words, for the verdict."""
+    if not view.get("priority"):
+        return None
+    out = view["priority"]
+    if view.get("position"):
+        out += " at position %s" % view["position"]
+    return out
+
+
+def verdict(with_token, without, device, queues=None):
     """What the two tasks say, strongest evidence first.
 
     jobArn is the one that matters. AWS says a task without the token gets no
     priority and bills standalone, so association is what the token carries.
 
-    queuePriority only exists while a task waits, so it is reported when we
-    saw it and not otherwise. A simulator usually shows nothing here.
+    Then the queue each task waited in, read from the task itself, and then
+    the order they finished in. The token task went in after the control, so
+    finishing before it means it was served out of order.
+
+    The device counters are not consulted. They lag a submit by minutes and
+    are the reason earlier runs read nothing.
     """
     out = []
     if with_token.get("job"):
@@ -353,68 +603,108 @@ def verdict(
             "says nothing. Something other than the token is linking them."
         )
 
-    # Queue depth is counted per device and per queue, so a task landing in
-    # Priority shows up without having to catch it in flight.
-    settled = False
-
-    # The count itself beats the difference between two counts. Priority has
-    # read zero on every survey of these devices, so one task sitting in it
-    # after we submitted exactly one token task is the plainest evidence
-    # there is. Movement missed this because the counters lag a submit.
-    if after_token and after_token.get("priority", 0) > 0:
+    tq, cq = _where(with_token), _where(without)
+    if with_token.get("priority") == "Priority":
+        line = "IN THE PRIORITY QUEUE. The token task waited as %s" % tq
+        if cq:
+            line += ", the control as %s" % cq
+        out.append(line + ".")
+    elif with_token.get("priority") == "Normal":
         out.append(
-            "IN THE PRIORITY QUEUE. %d task%s waiting there against %d in "
-            "Normal, and the only token task submitted was ours."
-            % (
-                after_token["priority"],
-                "" if after_token["priority"] == 1 else "s",
-                after_token.get("normal", 0),
-            )
+            "NOT PRIORITISED. The token task waited in the Normal queue like "
+            "any other%s." % (", the control as %s" % cq if cq else "")
         )
-        settled = True
-
-    # A queue that emptied while the hold was coming up is not the same as a
-    # device that never had one. Taking the hold costs a couple of minutes,
-    # and a fast device clears its backlog in that time.
-    drained = by_token and by_token.get("normal", 0) < 0
-    if drained:
+    elif not cq:
+        # neither task was ever seen waiting, which is what an idle device or
+        # a simulator looks like. Ordering says nothing then either.
         out.append(
-            "The Normal queue lost %d tasks while the hold was provisioning, "
-            "so there was nothing left to jump by the time the token task "
-            "went in. Use --make-queue to build one after the hold is up."
-            % -by_token["normal"]
+            "Nothing was waiting on the device, so priority cannot be seen. "
+            "Rerun against a QPU with a queue."
         )
-        settled = True
-    if not settled and by_token and by_control:
-        if by_token.get("priority", 0) > 0 and by_control.get("normal", 0) > 0:
-            out.append(
-                "PRIORITISED. The token submit grew the Priority queue and "
-                "the control grew Normal."
-            )
-            settled = True
-        elif by_token.get("normal", 0) > 0:
-            out.append(
-                "NOT PRIORITISED. The token submit grew the Normal queue, so "
-                "the task queues like any other."
-            )
-            settled = True
+        return out
+    else:
+        out.append(
+            "The token task was never seen waiting, while the control waited "
+            "as %s." % cq
+        )
 
-    if not settled:
-        a, c = with_token.get("priority"), without.get("priority")
-        if a and c and a != c:
-            out.append("PRIORITISED. {} against {} without the token.".format(a, c))
-        elif a and c:
+    lag = seconds_between(without.get("created"), with_token.get("created"))
+    if lag is not None and lag < 0:
+        out.append(
+            "WARNING: the token task was created before the control, so the "
+            "finishing order says nothing."
+        )
+        return out
+    after = "" if lag is None else " %.0fs after the control" % lag
+
+    ts, cs = with_token.get("status"), without.get("status")
+    waited = any(
+        v.get("position") or v.get("position_last") for v in (with_token, without)
+    )
+    if ts == "COMPLETED" and not waited:
+        # the queue labels survive completion, but a position is only ever
+        # reported while a task waits. Neither had one, so neither waited,
+        # and finishing order on an idle device is submission order
+        took = seconds_between(with_token.get("created"), with_token.get("ended"))
+        out.append(
+            "NO CONTENTION. Neither task was ever seen waiting%s, so there "
+            "was no queue to jump and the finishing order says nothing. The "
+            "queue labels above are still the service's own. Rerun against a "
+            "device with a backlog."
+            % ("" if took is None else " and the token task ran in %.1fs" % took)
+        )
+        return out
+    if ts in ("FAILED", "CANCELLED"):
+        out.append(
+            "The token task %s, so it never ran and the order says nothing. "
+            "Check the task's failure reason in the console." % ts
+        )
+        return out
+    te = with_token.get("ended")
+    # a cancelled or failed control has an end time but never ran, so it
+    # counts as still waiting, not as finished
+    ce = without.get("ended") if cs not in ("FAILED", "CANCELLED") else None
+    if te and ce:
+        gap = seconds_between(te, ce)
+        if gap > 0:
             out.append(
-                "Same queuePriority either way ({}), so the token associates "
-                "but does not lift.".format(a)
+                "SERVED FIRST. Submitted%s and finished %.0fs before it." % (after, gap)
             )
         else:
             out.append(
-                "Nothing was waiting on the device, so priority cannot be "
-                "seen. Rerun against a QPU with a queue."
+                "SERVED IN ORDER. Submitted%s and finished %.0fs after it, so "
+                "the token bought no place." % (after, -gap)
             )
-
+    elif te:
+        pos = without.get("position_last")
+        where = " at position %s" % pos if pos else ""
+        if cs == "CANCELLED":
+            tail = "still waiting%s, and was cancelled afterwards" % where
+        else:
+            tail = "still %s%s" % (cs or "waiting", where)
+        out.append(
+            "SERVED FIRST. Submitted%s and finished while the control was %s."
+            % (after, tail)
+        )
+    else:
+        out.append(
+            "The token task did not finish while the hold was up (last seen "
+            "%s), so the order is unknown. Raise --max-seconds."
+            % (with_token.get("status") or "unknown")
+        )
     return out
+
+
+def estimate(device, shots, filler, filler_shots, max_seconds):
+    """What the run will cost, before anything is created."""
+    per = cost(device, shots)
+    if per is None:
+        return None
+    total = 2 * per
+    if filler:
+        total += filler * (cost(device, filler_shots) or 0)
+    total += HOLD_PER_HOUR * max_seconds / 3600.0
+    return total
 
 
 def main():
@@ -425,7 +715,22 @@ def main():
         "--max-seconds",
         type=int,
         default=900,
-        help="ceiling on the hold, so a mistake stops billing",
+        help="how long the hold may last. The token task has to finish inside "
+        "it, so give a slow device half an hour. A mistake stops billing here",
+    )
+    ap.add_argument(
+        "--follow-seconds",
+        type=int,
+        default=None,
+        help="after the token task finishes and the hold is released, keep "
+        "watching the control for this long so its finish time is on record. "
+        "Default is --max-seconds",
+    )
+    ap.add_argument(
+        "--cancel-control",
+        action="store_true",
+        help="cancel the control once the token task has finished instead of "
+        "waiting for it. Saves its shots, loses its finish time",
     )
     ap.add_argument(
         "--record",
@@ -454,17 +759,62 @@ def main():
         default=0,
         metavar="N",
         help="submit N filler tasks first so there is a Normal queue to jump. "
-        "Costs the task fee each, and they are cancelled afterwards",
+        "Costs the task fee each, and they are cancelled afterwards. Only "
+        "works on a device slow enough to queue: Cepheus ran six 500 shot "
+        "tasks in under a second, so there it buys nothing",
     )
     ap.add_argument(
         "--force",
         action="store_true",
         help="run even if the device is shut or has nothing queued",
     )
+    ap.add_argument(
+        "--inspect",
+        nargs="+",
+        metavar="TASK_ARN",
+        help="print what the service says about these tasks and stop. Free. "
+        "How long a device took to serve a task says whether a queue on it "
+        "is real, and the queue label is still on a finished task",
+    )
+    ap.add_argument(
+        "--pace",
+        type=int,
+        default=0,
+        metavar="N",
+        help="submit N plain tasks with no hold, at --filler-shots, follow "
+        "them to the end and report how long each took and whether they ran "
+        "one at a time. Says whether filler can build a queue here, for the "
+        "task fee and shots each",
+    )
+    ap.add_argument(
+        "--check-program",
+        action="store_true",
+        help="run the task program on the local simulator and stop. Free, "
+        "and the analog simulator checks Aquila's limits, so a refusal "
+        "here is one that would otherwise come after the hold is billing",
+    )
+    ap.add_argument(
+        "--log",
+        default="probe-hold.log",
+        metavar="PATH",
+        help="append everything printed, including the backend's progress "
+        "and any traceback, to this file. Empty to disable",
+    )
     args = ap.parse_args()
+
+    if args.log:
+        log_to(args.log)
 
     if args.survey:
         show_survey(args.shots)
+        return
+    if args.inspect:
+        os.environ["AWS_DEFAULT_REGION"] = region_for(args.inspect[0])
+        inspect(boto3.client("braket"), args.inspect)
+        return
+    if args.check_program:
+        check_program(args.device)
+        print("the program for %s runs on the local simulator" % args.device)
         return
 
     opts = {
@@ -481,6 +831,7 @@ def main():
         "shots": args.shots,
         "filler_tasks": args.make_queue,
         "filler_shots": args.filler_shots,
+        "max_seconds": args.max_seconds,
     }
 
     b = BraketBackend()
@@ -491,6 +842,7 @@ def main():
     # finding that out after provisioning wastes time and money.
     q0 = queue_depth(args.device)
     print("device queues:", q0)
+    d = None
     if args.device != SV1 and not args.force:
         from braket.aws import AwsDevice
 
@@ -513,17 +865,60 @@ def main():
                 "the device is outside its execution window, so the job would "
                 "just sit there. Wait for a window, or pass --force."
             )
-        if q0["normal"] == 0 and not args.make_queue:
+        if q0["normal"] == 0 and not (args.make_queue or args.pace):
             raise SystemExit(
                 "nothing is waiting on this device, so a priority comparison "
                 "would say nothing. Pick a busier one, pass --make-queue N to "
                 "build a backlog, or pass --force."
             )
+        total = estimate(
+            d, args.shots, args.make_queue, args.filler_shots, args.max_seconds
+        )
+        if total is not None and not args.pace:
+            print("this run costs about $%.2f if the hold runs its full time" % total)
+
+    if args.pace:
+        os.environ["AWS_DEFAULT_REGION"] = region_for(args.device)
+        per = cost(d, args.filler_shots) if d is not None else None
+        if per is not None:
+            print("this costs about $%.2f" % (per * args.pace))
+        rows = pace(
+            boto3.client("braket"),
+            args.device,
+            AwsSession().default_bucket(),
+            args.pace,
+            args.filler_shots,
+            sleep=time.sleep,
+            clock=time.time,
+        )
+        lines = pace_report(rows)
+        for line in lines:
+            print(line)
+        run.update({"pace": rows, "verdict": lines})
+        run["ended"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        record(args.record, run)
+        print("recorded to %s" % args.record)
+        return
 
     arn = None
     filler = []
+    # the device ARN names the region. The backend sets this too, but only
+    # once the hold is opened, and the client and bucket are made before that
+    os.environ["AWS_DEFAULT_REGION"] = region_for(args.device)
     braket = boto3.client("braket")
     bucket = AwsSession().default_bucket()
+    views = {}
+    control = with_token = None
+
+    def say(a, seen):
+        who = "token  " if a == with_token else "control"
+        where = ""
+        if seen["priority"]:
+            where = " %s queue" % seen["priority"]
+            if seen["position"]:
+                where += " position %s" % seen["position"]
+        print("  %s %-10s%s" % (who, seen["status"], where), flush=True)
+
     try:
         arn = b.open_session(opts)
         print("hybrid job:", arn)
@@ -532,6 +927,9 @@ def main():
         if not ok:
             raise SystemExit("never got the hold, nothing submitted, nothing spent")
 
+        # the container gives up the hold this long after it published the
+        # token, and everything the token task needs has to happen before then
+        hold_until = time.time() + args.max_seconds - 30
         run["hold_job"] = arn
         run["hold_ready_after_s"] = getattr(b, "_hold_ready_after", None)
         token = b.session_id(arn)
@@ -539,57 +937,100 @@ def main():
         print("job state at submit time:", b._hold_job.state())
 
         # Build the backlog now, not before the hold. Taking the hold costs a
-        # couple of minutes, and a fast device empties in that time: four ten
-        # shot tasks on Cepheus were all COMPLETED before the hold was ready,
-        # so there was nothing left to jump.
+        # couple of minutes, and a fast device empties in that time.
         if args.make_queue:
             filler = make_queue(
                 braket, args.device, bucket, args.make_queue, args.filler_shots
             )
-            q0 = settled_depth(args.device)
-            print("queued %d filler tasks, device now %s" % (len(filler), q0))
-            if q0["normal"] == 0:
-                print(
-                    "the filler ran before it could queue. %d tasks of %d "
-                    "shots is not enough to occupy this device, so raise "
-                    "--filler-shots." % (args.make_queue, args.filler_shots)
+            run["filler_arns"] = filler
+            print("queued %d filler tasks" % len(filler))
+            for a in filler:
+                print("  filler:     ", a)
+
+        # control first, so the token task has something to overtake.
+        # Finishing first after being submitted first would prove nothing.
+        control = submit(braket, args.device, bucket, None, args.shots)
+        with_token = submit(braket, args.device, bucket, token, args.shots)
+        q1 = queue_depth(args.device)
+        print("\ncontrol:    ", control)
+        print("with token: ", with_token)
+        print("device queues after both (these lag):", q1)
+
+        print(
+            "\nwatching until the token task finishes, hold up for %ds"
+            % (hold_until - time.time())
+        )
+        follow(
+            braket,
+            [control, with_token],
+            timeout=hold_until - time.time(),
+            done=lambda v: v[with_token].get("status") in TERMINAL,
+            views=views,
+            say=say,
+            sleep=time.sleep,
+            clock=time.time,
+        )
+        q2 = queue_depth(args.device)
+        run["queues"] = {"before": q0, "after_submit": q1, "after_token": q2}
+
+        # the hold has done its work, stop paying for it before waiting on
+        # the control
+        print("\nreleasing the hold")
+        b.close_session()
+        arn = None
+
+        if views[control].get("status") not in TERMINAL:
+            if args.cancel_control:
+                print("cancelling the control")
+                drain_queue(braket, [control])
+                # one more look, so the record says cancelled and not queued
+                follow(
+                    braket,
+                    [control],
+                    timeout=0,
+                    views=views,
+                    say=say,
+                    sleep=time.sleep,
+                    clock=time.time,
+                )
+            else:
+                left = (
+                    args.max_seconds
+                    if args.follow_seconds is None
+                    else args.follow_seconds
+                )
+                print("watching the control for up to %ds more" % left)
+                follow(
+                    braket,
+                    [control],
+                    timeout=left,
+                    views=views,
+                    say=say,
+                    sleep=time.sleep,
+                    clock=time.time,
                 )
 
-        with_token = submit(braket, args.device, bucket, token, args.shots)
-        q1 = settled_depth(args.device)
-        print("\nwith the token:", with_token, "queues", q1)
-
-        without = submit(braket, args.device, bucket, None, args.shots)
-        q2 = settled_depth(args.device)
-        print("without it:    ", without, "queues", q2)
-
-        by_token, by_control = moved(q0, q1), moved(q1, q2)
-        print("\nmovement, token submit:  ", by_token)
-        print("movement, control submit:", by_control)
-
-        seen = settle(braket, [with_token, without])
-        a, c = seen[with_token], seen[without]
-        print("\n  %-10s %-30s %s" % ("", "with token", "without"))
-        for k in ("status", "job", "queue", "position", "priority"):
+        a, c = views[with_token], views[control]
+        print("\n  %-10s %-30s %s" % ("", "with token", "control"))
+        for k in ("status", "job", "priority", "position", "created", "ended"):
             print("  %-10s %-30s %s" % (k, a.get(k), c.get(k)))
 
         run.update(
             {
-                "queues": {"before": q0, "after_token": q1, "after_control": q2},
-                "moved": {"token": by_token, "control": by_control},
                 "with_token": {"arn": with_token, **a},
-                "without": {"arn": without, **c},
+                "without": {"arn": control, **c},
             }
         )
-        lines = verdict(a, c, args.device, by_token, by_control, q1)
+        lines = verdict(a, c, args.device)
         run["verdict"] = lines
+        print()
         for line in lines:
             print(line)
 
         # which physical qubits ran, so the result can be read against the
         # calibration for those edges
         run["with_token"]["qubits"] = used_qubits(with_token)
-        run["without"]["qubits"] = used_qubits(without)
+        run["without"]["qubits"] = used_qubits(control)
     finally:
         run["ended"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         try:
