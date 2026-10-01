@@ -18,6 +18,7 @@ from .base import (
 )
 from . import ibm  # noqa: F401  (registers IBMBackend)
 from . import braket  # noqa: F401  (registers BraketBackend)
+from . import ionq  # noqa: F401  (registers IonQBackend)
 
 if os.environ.get("FLUX_QUANTUM_MOCK"):
     from . import mock  # noqa: F401  (registers MockBackend, MockBusyBackend)

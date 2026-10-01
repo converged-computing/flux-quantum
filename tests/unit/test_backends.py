@@ -12,7 +12,7 @@ IBM_CREDS = {
 
 
 def test_real_backends_registered(backends_real):
-    assert backends_real.known_vendors() == {"ibm", "braket"}
+    assert backends_real.known_vendors() == {"ibm", "braket", "ionq"}
 
 
 def test_mock_gated_by_env(backends_real, backends_mock):
@@ -75,21 +75,12 @@ def test_mock_needs_no_creds(backends_mock):
     assert backends_mock.get_backend("mock") is not None
 
 
-def test_backend_declares_options_and_scout_options_roundtrip(fresh, monkeypatch):
-    """A vendor backend declares CLI options and extracts them from args."""
+def test_scout_options_map_the_common_device_to_the_resource(fresh, monkeypatch):
+    """A vendor backend takes the common options and speaks its own terms."""
     _fake_qrmi(monkeypatch)
     b = fresh(mock=False, env=IBM_CREDS)
 
-    ibm = b.get_backend("ibm")
-    declared = []
-    ibm.add_options(lambda name, **kw: declared.append(name))
-    assert "--ibm-resource" in declared and "--ibm-type" in declared
-
-    class _Args:
-        ibm_resource = "ibm_kingston"
-        ibm_type = None
-
-    opts = ibm.scout_options(_Args())
+    opts = b.get_backend("ibm").scout_options({"device": "ibm_kingston"})
     assert opts["resource"] == "ibm_kingston"
     assert opts["type"] == "qiskit-runtime-service"
 
@@ -99,11 +90,7 @@ def test_scout_options_infer_the_resource_from_the_environment(fresh, monkeypatc
     _fake_qrmi(monkeypatch)
     b = fresh(mock=False, env=IBM_CREDS)
 
-    class _Args:
-        ibm_resource = None
-        ibm_type = None
-
-    assert b.get_backend("ibm").scout_options(_Args())["resource"] == "ibm_kingston"
+    assert b.get_backend("ibm").scout_options({})["resource"] == "ibm_kingston"
 
 
 def test_job_environment_follows_the_qrmi_convention(fresh, monkeypatch):
