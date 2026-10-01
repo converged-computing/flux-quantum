@@ -41,8 +41,8 @@ missing, and never prints a value.
 
 unset FLUX_QUANTUM_MOCK
 flux submit -t 30m \
-  --quantum-vendor ibm --quantum-ibm-resource <your_backend> \
-  --quantum-ibm-warmup-timeout 600 \
+  --quantum-vendor ibm --quantum-device <your_backend> \
+  --quantum-wait 600 \
   -n4 flux python /opt/flux-quantum/examples/qrmi/workload.py
 
 flux jobs -a
@@ -51,12 +51,12 @@ flux job eventlog <classical-id> | grep memo
 
 ## Submit
 
-    flux submit -t 30m --quantum-vendor ibm --quantum-ibm-resource ibm_kingston \
+    flux submit -t 30m --quantum-vendor ibm --quantum-device ibm_kingston \
         -n4 flux python examples/qrmi/workload.py
 
 stdout is the scout id. The classical job id comes back on stderr. If only one
 resource has credentials in the environment you can drop
-`--quantum-ibm-resource` and we work it out.
+`--quantum-device` and we work it out.
 
     flux jobs -a
     flux job eventlog <classical-id> | grep memo
@@ -64,7 +64,7 @@ resource has credentials in the environment you can drop
 
 ## You need an account that can open sessions
 
-The qiskit-runtime-service type opens a session, which IBM only allows on plans that support sessions (Premium). Open and Pay As You Go plans can submit tasks but not hold a session, IBM returns a 403, and flux-quantum cancels the held classical job. Use `--quantum-ibm-type ibm-quantum-system` for direct access instead.
+The qiskit-runtime-service type opens a session, which IBM only allows on plans that support sessions (Premium). Open and Pay As You Go plans can submit tasks but not hold a session, IBM returns a 403, and flux-quantum cancels the held classical job. Export `FLUX_QUANTUM_IBM_TYPE=ibm-quantum-system` for direct access instead.
 
 ## A session is not the same as having the QPU
 
@@ -76,12 +76,12 @@ classical job. If the warmup never runs, the scout releases the session and
 fails the submit instead of starting the classical job against a QPU it does
 not have.
 
-    --quantum-ibm-warmup-timeout SECONDS   give up after this long. Default 0,
+    --quantum-wait SECONDS                 give up after this long. Default 0,
                                            which means wait as long as the
                                            scout job is allowed to live
-    --quantum-ibm-skip-warmup              release as soon as the session opens,
+    FLUX_QUANTUM_IBM_SKIP_WARMUP=1         release as soon as the session opens,
                                            no priority guarantee
-    --quantum-ibm-ready-timeout SECONDS    default 120, how long to wait for the
+    FLUX_QUANTUM_IBM_READY_TIMEOUT=N       default 120, how long to wait for the
                                            backend to report itself up
 
 The warmup costs one shot.

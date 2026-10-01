@@ -6,7 +6,8 @@ There are two so ranking policies can be exercised without credentials.
     mock       queue_depth 0, wins --select any
     mock_busy  queue_depth 9, so --select queue prefers mock
 
-FLUX_QUANTUM_MOCK_QUEUE and FLUX_QUANTUM_MOCK_COST override the mock vendor.
+FLUX_QUANTUM_MOCK_QUEUE and FLUX_QUANTUM_MOCK_COST are what probe reports, and
+the simulated wait is set from FLUX_QUANTUM_MOCK_* too, see scout_options.
 
 The mock also simulates a vendor queue, which is the only way to control queue
 depth as an experiment variable. No real vendor lets you do that. The wait is
@@ -22,74 +23,41 @@ import os
 import random
 import time
 
-from .base import Backend, Signals, register
+from .base import Backend, Signals, register, tuning
 
 
 @register
 class MockBackend(Backend):
     name = "mock"
 
-    @classmethod
-    def add_options(cls, add_option):
-        add_option(
-            "--mock-session",
-            metavar="ID",
-            default=None,
-            help="mock: force this session id (testing)",
-        )
-        add_option(
-            "--mock-latency",
-            metavar="SECONDS",
-            default=None,
-            help="mock: delay this many seconds before opening a session",
-        )
-        add_option(
-            "--mock-queue-depth",
-            metavar="N",
-            default=None,
-            help="mock: tasks ahead of us in the simulated vendor queue",
-        )
-        add_option(
-            "--mock-service-time",
-            metavar="SECONDS",
-            default=None,
-            help="mock: seconds per task ahead of us, default 0.1 so a deep "
-            "queue still finishes in a runnable time",
-        )
-        add_option(
-            "--mock-base-overhead",
-            metavar="SECONDS",
-            default=None,
-            help="mock: fixed wait even at depth 0, default 10 which is what "
-            "ibm_marrakesh measured",
-        )
-        add_option(
-            "--mock-jitter",
-            metavar="FRACTION",
-            default=None,
-            help="mock: multiplicative noise on the wait, 0 for a "
-            "deterministic run which is what an experiment wants",
-        )
-        add_option(
-            "--mock-seed",
-            metavar="N",
-            default=None,
-            help="mock: seed for the jitter, so a run can be repeated",
-        )
+    holds = ("session", "probe")
 
-    def scout_options(self, args):
-        def num(name, default):
-            v = getattr(args, name, None)
-            return default if v is None else float(v)
+    def scout_options(self, common):
+        """The simulated queue is an experiment instrument, so its knobs are
+        environment variables and not submit options:
 
+            FLUX_QUANTUM_MOCK_SESSION        force this session id
+            FLUX_QUANTUM_MOCK_LATENCY        seconds before opening a session
+            FLUX_QUANTUM_MOCK_QUEUE          tasks ahead of us, also what
+                                             probe reports
+            FLUX_QUANTUM_MOCK_SERVICE_TIME   seconds per task ahead, 0.1
+            FLUX_QUANTUM_MOCK_BASE_OVERHEAD  fixed wait at depth 0, 10, which
+                                             is what ibm_marrakesh measured
+            FLUX_QUANTUM_MOCK_JITTER         multiplicative noise, 0 for a
+                                             deterministic run
+            FLUX_QUANTUM_MOCK_SEED           seed for the jitter
+        """
+        self.check_hold(common.get("hold"))
         return {
-            "session": getattr(args, "mock_session", None),
-            "latency": getattr(args, "mock_latency", None),
-            "queue_depth": int(num("mock_queue_depth", 0)),
-            "service_time": num("mock_service_time", 0.1),
-            "base_overhead": num("mock_base_overhead", 10.0),
-            "jitter": num("mock_jitter", 0.0),
-            "seed": getattr(args, "mock_seed", None),
+            "device": common.get("device") or "mock",
+            "session": tuning("mock_session"),
+            "latency": tuning("mock_latency"),
+            "queue_depth": int(tuning("mock_queue", 0)),
+            "service_time": float(tuning("mock_service_time", 0.1)),
+            "base_overhead": float(tuning("mock_base_overhead", 10.0)),
+            "jitter": float(tuning("mock_jitter", 0.0)),
+            "seed": tuning("mock_seed"),
+            "dry_run": bool(common.get("dry_run")),
         }
 
     def queue_wait(self, options):

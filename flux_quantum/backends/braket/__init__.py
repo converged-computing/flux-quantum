@@ -1,14 +1,22 @@
 """AWS Braket backend.
 
-Two ways to take a device, set with --braket-hold.
+Two ways to take a device, set with --quantum-hold.
 
-probe is the default. Submit a trivial task and wait for it to reach the front
-of the queue. That reserves nothing, so another user can take the device
-between our task running and the classical job starting.
+session, the default, starts a hybrid job. Braket runs one hybrid job at a
+time per QPU and gives it priority, and the job publishes
+AMZN_BRAKET_JOB_TOKEN. A task created with that token gets the job's priority
+and bills to the job. Without it, neither. Internally this is hold=job.
 
-job starts a hybrid job. Braket runs one hybrid job at a time per QPU and gives
-it priority, and the job publishes AMZN_BRAKET_JOB_TOKEN. A task created with
-that token gets the job's priority and bills to the job. Without it, neither.
+probe submits a trivial task and waits for it to reach the front of the
+queue. That reserves nothing, so another user can take the device between our
+task running and the classical job starting.
+
+Tuning, from the environment:
+
+    FLUX_QUANTUM_BRAKET_HOLD_INSTANCE   instance for the hybrid job, ml.m5.large
+    FLUX_QUANTUM_BRAKET_SHOTS           shots for the probe task, 1
+    FLUX_QUANTUM_BRAKET_UNGATE_POSITION probe: release at this queue position, 1
+    FLUX_QUANTUM_BRAKET_REGION          region, otherwise the one in the ARN
 
 So the hybrid job is the scout and the token is the session id. The classical
 work stays on our cluster instead of the small instance Braket gives the job,
@@ -23,7 +31,7 @@ import json
 import os
 import time
 
-from .base import Backend, BackendError, Signals, register
+from ..base import Backend, BackendError, Signals, register, tuning
 
 try:
     import boto3
@@ -277,84 +285,23 @@ class BraketBackend(Backend):
         self._hold_started = None
         self._hold_ready_after = None
 
-    @classmethod
-    def add_options(cls, add_option):
-        add_option(
-            "--braket-device",
-            metavar="ARN",
-            default=None,
-            help="Braket: device ARN, defaults to the SV1 simulator",
-        )
-        add_option(
-            "--braket-region",
-            metavar="REGION",
-            default=None,
-            help="Braket: AWS region, defaults to the one in the device ARN",
-        )
-        add_option(
-            "--braket-shots",
-            metavar="N",
-            default=None,
-            help="Braket: shots for the queue probe task, default 1",
-        )
-        add_option(
-            "--braket-ungate-position",
-            metavar="N",
-            default=None,
-            help="Braket: release the classical job once the probe task is at "
-            "this queue position or closer. Default 1, next in line. Raise it "
-            "when the classical job is slow to start",
-        )
-        add_option(
-            "--braket-hold",
-            metavar="MODE",
-            default=None,
-            help="Braket: how to take the device. probe waits for the front "
-            "of the queue, the default. job starts a hybrid job, which holds "
-            "the priority queue and hands out a token that work anywhere can "
-            "submit with",
-        )
-        add_option(
-            "--braket-hold-instance",
-            metavar="TYPE",
-            default=None,
-            help="Braket: instance for the holding hybrid job. Default "
-            "ml.m5.large, the cheapest, since it does no work",
-        )
-        add_option(
-            "--braket-hold-max-seconds",
-            metavar="SECONDS",
-            default=None,
-            help="Braket: give up the queue slot after this long, so a scout "
-            "that is never released stops billing. Default 900",
-        )
-        add_option(
-            "--braket-queue-timeout",
-            metavar="SECONDS",
-            default=None,
-            help="Braket: give up if the probe task is still queued after this "
-            "long. Default 0, meaning wait as long as the scout may run",
-        )
+    simulator = SV1
+    holds = ("session", "probe")
 
-    def scout_options(self, args):
-        device = getattr(args, "braket_device", None) or SV1
-        shots = getattr(args, "braket_shots", None)
-        timeout = getattr(args, "braket_queue_timeout", None)
+    def scout_options(self, common):
+        hold = self.check_hold(common.get("hold"))
+        device = common.get("device") or SV1
         return {
             "device": device,
-            "region": region_for(device, getattr(args, "braket_region", None)),
-            "hold": getattr(args, "braket_hold", None) or "probe",
-            "hold_instance": getattr(args, "braket_hold_instance", None)
-            or "ml.m5.large",
-            "hold_max_seconds": float(
-                getattr(args, "braket_hold_max_seconds", None) or 900
-            ),
-            "shots": 1 if shots is None else int(shots),
-            "queue_timeout": 0 if timeout is None else float(timeout),
-            "ungate_position": int(
-                getattr(args, "braket_ungate_position", None)
-                or os.environ.get("QUANTUM_BRAKET_UNGATE_POSITION", 1)
-            ),
+            "region": region_for(device, tuning("braket_region")),
+            # the hybrid job is Braket's session
+            "hold": "job" if hold == "session" else "probe",
+            "hold_instance": tuning("braket_hold_instance", "ml.m5.large"),
+            "hold_max_seconds": float(common.get("hold_max") or 900),
+            "shots": int(tuning("braket_shots", 1)),
+            "queue_timeout": float(common.get("wait") or 0),
+            "ungate_position": int(tuning("braket_ungate_position", 1)),
+            "dry_run": bool(common.get("dry_run")),
         }
 
     def job_environment(self, options):
@@ -421,8 +368,10 @@ class BraketBackend(Backend):
         max_seconds = int(options.get("hold_max_seconds") or 900)
         self._hold_job = AwsQuantumJob.create(
             device=device_arn,
-            source_module=os.path.dirname(os.path.abspath(hold.__file__)),
-            entry_point="hold.entry:main",
+            # the one file is the whole job. Uploading the package would put
+            # a module named braket in the container, next to the SDK's
+            source_module=os.path.abspath(hold.__file__),
+            entry_point="hold:main",
             job_name=name,
             instance_config=InstanceConfig(
                 instanceType=options.get("hold_instance") or "ml.m5.large",

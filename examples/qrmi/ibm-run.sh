@@ -91,14 +91,15 @@ from flux_quantum.backends import get_backend
 print(get_backend('ibm').credential_note)" | tee -a "$OUT/run.txt" || die "credentials incomplete"
 
 # 3. submit. The classical job prints and exits, so the billed window is warmup plus a few seconds.
-warmup_args="--quantum-ibm-warmup-timeout $WARMUP_TIMEOUT"
-[ "$SKIP_WARMUP" = 1 ] && warmup_args="--quantum-ibm-skip-warmup"
+# the warm-up wait is the common --quantum-wait, skipping it is operator tuning
+warmup_args="--quantum-wait $WARMUP_TIMEOUT"
+[ "$SKIP_WARMUP" = 1 ] && export FLUX_QUANTUM_IBM_SKIP_WARMUP=1
 
 say "submitting"
 t0=$(date +%s)
 err=$(mktemp)
 scout=$(flux submit -t "$WALLTIME" --quantum-vendor ibm \
-            --quantum-ibm-resource "$RESOURCE" $warmup_args -n"$NTASKS" \
+            --quantum-device "$RESOURCE" $warmup_args -n"$NTASKS" \
             -- sh -c "echo classical got \$QUANTUM_SESSION_ID; sleep $SLEEP" 2>"$err")
 tee -a "$OUT/run.txt" < "$err"
 main=$(grep -oE 'held classical job [0-9]+' "$err" | awk '{print $NF}')

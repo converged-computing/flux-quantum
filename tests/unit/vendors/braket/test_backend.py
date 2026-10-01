@@ -109,15 +109,10 @@ def test_defaults_to_the_sv1_simulator(fake_braket):
     """SV1 is cents per task, so it is the sane default for a probe."""
     from flux_quantum.backends.braket import SV1
 
-    class Args:
-        braket_device = None
-        braket_region = None
-        braket_shots = None
-        braket_queue_timeout = None
-
-    opts = _backend().scout_options(Args())
+    opts = _backend().scout_options({})
     assert opts["device"] == SV1
     assert opts["shots"] == 1
+    assert opts["queue_timeout"] == 0
 
 
 def test_region_comes_from_the_device_arn(monkeypatch):

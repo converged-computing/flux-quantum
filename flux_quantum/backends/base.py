@@ -11,7 +11,44 @@ __init__, so nothing downstream ever holds an unusable backend.
 Adding a vendor means adding a Backend subclass and registering it.
 """
 
+import os
 from abc import ABC, abstractmethod
+
+# The submit options every vendor is driven by. The CLI collects them once,
+# and each backend maps them to its own terms in scout_options. A user picks
+# the vendor and the device and nothing else changes between vendors.
+#
+#   device    the vendor's own name for the device: a Braket ARN, an IonQ
+#             backend, a QRMI resource id. Each vendor has a default
+#   hold      session takes the vendor's real hold, a hybrid job on Braket,
+#             a session on IonQ and IBM. probe submits a front of queue job
+#             and holds nothing
+#   hold_max  seconds the hold may last, so a scout that is never released
+#             stops costing
+#   wait      seconds to wait for the hold to be ours before giving up and
+#             cancelling the held job. 0 means as long as the scout may run
+#   dry_run   run on the vendor's simulator
+COMMON_OPTIONS = ("device", "hold", "hold_max", "wait", "dry_run")
+HOLDS = ("session", "probe")
+
+
+def tuning(name, default=None):
+    """An operator setting from the environment, FLUX_QUANTUM_<NAME>.
+
+    Things like the instance the Braket hold runs on or the shot count of a
+    warm-up job are tuning for whoever operates the installation, not a
+    choice for someone submitting a job, so they are not submit options.
+    """
+    return os.environ.get("FLUX_QUANTUM_" + name.upper(), default)
+
+
+def truthy(value):
+    """An environment value read as a flag."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no")
+    return bool(value)
 
 
 class BackendError(RuntimeError):
@@ -40,21 +77,51 @@ class Backend(ABC):
     # vendor key like ibm, must match the qdevice_<name> graph type
     name = None
 
+    # what a dry run targets, or None when the vendor has no simulator
+    simulator = None
+
+    # the holds this vendor can take, out of HOLDS
+    holds = ("session",)
+
     # set by __init__ to say where the credentials came from, for the log
     credential_note = ""
 
-    @classmethod
-    def add_options(cls, add_option):
-        """Declare the flux submit options for this vendor.
+    def scout_options(self, common):
+        """Map the common submit options onto this vendor's terms.
 
-        Names get a quantum prefix, so --ibm-backend becomes
-        --quantum-ibm-backend. Namespace them by vendor to avoid collisions.
+        common has the COMMON_OPTIONS keys. What comes back is whatever
+        open_session and wait_for_priority need, and it travels to the
+        scout as JSON. The default passes the common options through.
         """
-        return
+        self.check_hold(common.get("hold"))
+        return dict(common)
 
-    def scout_options(self, args):
-        """Return the options for this vendor from the parsed args."""
-        return {}
+    def check_hold(self, hold):
+        """Refuse a hold this vendor cannot take, at submit time, before
+        anything is held."""
+        hold = hold or "session"
+        if hold not in HOLDS:
+            raise BackendError(
+                "{}: unknown hold {}. The holds are {}".format(
+                    self.name, hold, " and ".join(HOLDS)
+                )
+            )
+        if hold not in self.holds:
+            raise BackendError(
+                "{}: this vendor has no {} hold, only {}".format(
+                    self.name, hold, " and ".join(self.holds)
+                )
+            )
+        return hold
+
+    def dry_run(self, common):
+        """The common options for a dry run: the device becomes the
+        simulator. A vendor whose simulator needs more, such as a noise
+        model standing in for the hardware, adds it here."""
+        out = dict(common, dry_run=True)
+        if self.simulator:
+            out["device"] = self.simulator
+        return out
 
     def session_id(self, opened):
         """What the classical job should be handed.

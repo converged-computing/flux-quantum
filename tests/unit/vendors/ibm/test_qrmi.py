@@ -109,19 +109,29 @@ def test_close_without_open_is_harmless(fake_qrmi):
 
 
 def test_resource_is_inferred_when_only_one_is_configured(fake_qrmi):
-    class Args:
-        ibm_resource = None
-        ibm_type = None
-
-    assert _ibm().scout_options(Args())["resource"] == RESOURCE
+    assert _ibm().scout_options({})["resource"] == RESOURCE
 
 
 def test_explicit_resource_wins(fake_qrmi):
-    class Args:
-        ibm_resource = "ibm_fez"
-        ibm_type = None
+    assert _ibm().scout_options({"device": "ibm_fez"})["resource"] == "ibm_fez"
 
-    assert _ibm().scout_options(Args())["resource"] == "ibm_fez"
+
+def test_ibm_has_no_probe_hold(fake_qrmi):
+    """QRMI acquires a session or nothing, so a probe is refused at submit
+    time, before anything is held."""
+    from flux_quantum.backends import BackendError
+
+    with pytest.raises(BackendError, match="no probe hold"):
+        _ibm().scout_options({"hold": "probe"})
+
+
+def test_the_warmup_wait_is_the_common_wait(fake_qrmi, monkeypatch):
+    monkeypatch.setenv("FLUX_QUANTUM_IBM_SKIP_WARMUP", "1")
+    monkeypatch.setenv("FLUX_QUANTUM_IBM_TYPE", "ibm-quantum-system")
+    opts = _ibm().scout_options({"wait": 600})
+    assert opts["warmup_timeout"] == 600
+    assert opts["skip_warmup"] is True
+    assert opts["type"] == "ibm-quantum-system"
 
 
 def test_job_environment_matches_the_qrmi_convention(fake_qrmi):
@@ -314,4 +324,4 @@ def test_missing_qiskit_says_what_to_install(fake_qrmi, monkeypatch):
     with pytest.raises(RuntimeError) as e:
         b.wait_for_priority({})
     assert "qrmi[ibm]" in str(e.value)
-    assert "skip-warmup" in str(e.value)
+    assert "SKIP_WARMUP" in str(e.value)

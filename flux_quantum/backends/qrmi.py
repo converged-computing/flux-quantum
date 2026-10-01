@@ -20,7 +20,7 @@ import json
 import os
 import time
 
-from .base import Backend, BackendError, Signals
+from .base import Backend, BackendError, Signals, truthy, tuning
 
 try:
     from qrmi import Payload, QuantumResource, ResourceType, TaskStatus
@@ -114,7 +114,7 @@ def warmup_payload(shots=1):
     if QuantumCircuit is None:
         raise RuntimeError(
             "qiskit is needed to build the warmup task. Install it with "
-            "pip install 'qrmi[ibm]', or pass --quantum-ibm-skip-warmup to "
+            "pip install 'qrmi[ibm]', or export FLUX_QUANTUM_IBM_SKIP_WARMUP=1 to "
             "release without confirming priority"
         )
 
@@ -143,7 +143,7 @@ def explain_acquire_failure(error, resource, rtype):
             "sessions on plans that support them, such as Premium. On an Open "
             "or Pay As You Go plan you can submit tasks but not hold a "
             "session, so there is nothing for the scout to co-allocate.\n"
-            "  use --quantum-ibm-type ibm-quantum-system if you have direct "
+            "  export FLUX_QUANTUM_IBM_TYPE=ibm-quantum-system if you have direct "
             "access, or --quantum-vendor mock to test the pipeline.\n"
             "  QRMI said: {e}".format(r=resource, t=rtype, e=text)
         )
@@ -207,63 +207,32 @@ class QRMIBackend(Backend):
         self._resource = None
         self._lock = None
 
-    @classmethod
-    def add_options(cls, add_option):
-        add_option(
-            "--{}-resource".format(cls.name),
-            metavar="ID",
-            default=None,
-            help="{}: QRMI resource id, for example ibm_kingston".format(cls.name),
-        )
-        add_option(
-            "--{}-ready-timeout".format(cls.name),
-            metavar="SECONDS",
-            default=None,
-            help="{}: wait this long after acquiring for the resource to report "
-            "itself accessible, 0 to skip. Default 120".format(cls.name),
-        )
-        add_option(
-            "--{}-skip-warmup".format(cls.name),
-            action="store_true",
-            help="{}: release the classical job as soon as the session opens, "
-            "without waiting for a warmup task to reach the head of the "
-            "queue. Faster, but priority is not confirmed".format(cls.name),
-        )
-        add_option(
-            "--{}-warmup-timeout".format(cls.name),
-            metavar="SECONDS",
-            default=None,
-            help="{}: give up if the warmup task is still queued after this "
-            "long. Default 0, meaning wait for as long as the scout job "
-            "is allowed to run".format(cls.name),
-        )
-        add_option(
-            "--{}-type".format(cls.name),
-            metavar="TYPE",
-            default=None,
-            help="{}: QRMI resource type, default {}".format(
-                cls.name, cls.default_type
-            ),
-        )
+    def scout_options(self, common):
+        """QRMI's terms. The device is the resource id, and the type, the
+        readiness wait and the warm-up are operator tuning:
 
-    def scout_options(self, args):
-        rtype = getattr(args, "{}_type".format(self.name), None) or self.default_type
-        resource = getattr(args, "{}_resource".format(self.name), None)
+            FLUX_QUANTUM_<VENDOR>_TYPE           resource type
+            FLUX_QUANTUM_<VENDOR>_READY_TIMEOUT  seconds for the resource to
+                                                 report accessible, 120
+            FLUX_QUANTUM_<VENDOR>_SKIP_WARMUP    release as soon as the
+                                                 session opens, no priority
+                                                 confirmed
+        """
+        self.check_hold(common.get("hold"))
+        rtype = tuning(self.name + "_type") or self.default_type
+        resource = common.get("device")
         if not resource:
             # only one resource configured in the environment is unambiguous
             found = resources_in_environment(rtype)
             if len(found) == 1:
                 resource = found[0]
-        ready = getattr(args, "{}_ready_timeout".format(self.name), None)
-        warmup = getattr(args, "{}_warmup_timeout".format(self.name), None)
         return {
             "resource": resource,
             "type": rtype,
-            "ready_timeout": 120 if ready is None else float(ready),
-            "skip_warmup": bool(
-                getattr(args, "{}_skip_warmup".format(self.name), False)
-            ),
-            "warmup_timeout": 0 if warmup is None else float(warmup),
+            "ready_timeout": float(tuning(self.name + "_ready_timeout", 120)),
+            "skip_warmup": truthy(tuning(self.name + "_skip_warmup")),
+            "warmup_timeout": float(common.get("wait") or 0),
+            "dry_run": bool(common.get("dry_run")),
         }
 
     def job_environment(self, options):
@@ -282,8 +251,8 @@ class QRMIBackend(Backend):
         rtype = options.get("type") or self.default_type
         if not resource:
             raise ValueError(
-                "{}: no QRMI resource id. Pass --quantum-{}-resource or export "
-                "the credentials for exactly one resource".format(self.name, self.name)
+                "{}: no QRMI resource id. Pass --quantum-device or export "
+                "the credentials for exactly one resource".format(self.name)
             )
         missing = missing_env(resource, rtype)
         if missing:

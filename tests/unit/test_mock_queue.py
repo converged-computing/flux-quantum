@@ -18,20 +18,12 @@ def mock(monkeypatch):
     return mockmod.MockBackend()
 
 
-class Args:
-    mock_session = None
-    mock_latency = None
-    mock_queue_depth = None
-    mock_service_time = None
-    mock_base_overhead = None
-    mock_jitter = None
-    mock_seed = None
-
-
-def test_defaults_match_what_ibm_measured(mock):
+def test_defaults_match_what_ibm_measured(mock, monkeypatch):
     """ibm_marrakesh at depth 0 took 10 to 12 seconds to dequeue, so the fixed
     overhead is not invented."""
-    opts = mock.scout_options(Args())
+    for v in ("QUEUE", "SERVICE_TIME", "BASE_OVERHEAD", "JITTER"):
+        monkeypatch.delenv("FLUX_QUANTUM_MOCK_" + v, raising=False)
+    opts = mock.scout_options({})
     assert opts["base_overhead"] == 10.0
     assert opts["queue_depth"] == 0
     assert opts["service_time"] == 0.1
@@ -109,3 +101,14 @@ def test_position_is_reported_while_draining(mock, capsys):
     )
     out = capsys.readouterr().out
     assert "position 3" in out and "position 1" in out
+
+
+def test_the_knobs_are_environment_variables(mock, monkeypatch):
+    """Experiment parameters, not submit options. A run sets them once in
+    the environment and every submit in it sees the same queue."""
+    monkeypatch.setenv("FLUX_QUANTUM_MOCK_QUEUE", "25")
+    monkeypatch.setenv("FLUX_QUANTUM_MOCK_SERVICE_TIME", "0.5")
+    monkeypatch.setenv("FLUX_QUANTUM_MOCK_SESSION", "forced")
+    opts = mock.scout_options({"hold": "probe"})
+    assert opts["queue_depth"] == 25 and opts["service_time"] == 0.5
+    assert opts["session"] == "forced"

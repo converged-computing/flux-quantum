@@ -73,10 +73,20 @@ def test_plugin_registers_options_with_quantum_prefix(stub_flux_cli):
     plugin = shim.QuantumCLIPlugin("submit")  # flux instantiates as entry(prog)
     assert plugin.prefix == "quantum"
     names = {n for n, _ in plugin.options}
-    # core options always present
-    assert {"--vendor", "--select"} <= names
-    # each registered vendor backend contributes its own namespaced options
-    assert "--ibm-resource" in names and "--braket-device" in names
+    # the same options whichever vendor it is
+    assert {
+        "--vendor",
+        "--select",
+        "--device",
+        "--hold",
+        "--hold-max",
+        "--wait",
+        "--dry-run",
+    } <= names
+    # and nothing vendor specific
+    assert not [
+        n for n in names if n.startswith(("--ibm", "--braket", "--ionq", "--mock"))
+    ]
 
 
 def test_plugin_inactive_for_other_progs(stub_flux_cli):
@@ -453,3 +463,88 @@ def test_prepare_pair_asks_before_submitting_anything(stub_flux_cli, monkeypatch
     # both halves were described to the check
     assert order[0][1] is not None and order[0][2] is not None
     assert any(x[0] == "submitted" for x in order)
+
+
+def test_common_options_have_defaults_and_follow_the_duration(
+    stub_flux_cli, monkeypatch
+):
+    """Setting a walltime sets the hold limit, with the scout's slack."""
+    monkeypatch.delenv("FLUX_QUANTUM_MOCK", raising=False)
+    cli = importlib.import_module("flux_quantum.cli")
+
+    c = cli.common_options(_make_args(), {"attributes": {"system": {"duration": 600}}})
+    assert c == {
+        "device": None,
+        "hold": "session",
+        "hold_max": 900.0,
+        "wait": 0.0,
+        "dry_run": False,
+    }
+    assert cli.common_options(_make_args(), None)["hold_max"] == 900.0
+
+    c = cli.common_options(
+        _make_args(
+            quantum_device="ibm_fez",
+            quantum_hold="probe",
+            quantum_hold_max="30",
+            quantum_wait="5",
+            quantum_dry_run=True,
+        )
+    )
+    assert c["device"] == "ibm_fez" and c["hold"] == "probe"
+    assert c["hold_max"] == 30.0 and c["wait"] == 5.0 and c["dry_run"]
+
+
+def test_the_prefixed_name_wins_over_a_bare_one(stub_flux_cli):
+    """flux has a --wait of its own. The plugin's is read by its prefixed
+    name first."""
+    cli = importlib.import_module("flux_quantum.cli")
+    assert cli._opt(_make_args(wait=True, quantum_wait="7"), "wait") == "7"
+    assert cli._opt(_make_args(device="d"), "device") == "d"
+
+
+def test_mock_makes_every_submit_a_dry_run(stub_flux_cli, monkeypatch):
+    monkeypatch.setenv("FLUX_QUANTUM_MOCK", "1")
+    cli = importlib.import_module("flux_quantum.cli")
+    assert cli.common_options(_make_args())["dry_run"]
+
+
+def _vendor(simulator=None, holds=("session",)):
+    from flux_quantum.backends.base import Backend
+
+    class V(Backend):
+        name = "v"
+
+        def scout_options(self, common):
+            self.check_hold(common.get("hold"))
+            return dict(common, mapped=True)
+
+        def probe(self):
+            raise NotImplementedError
+
+    V.simulator = simulator
+    V.holds = holds
+    return V()
+
+
+def test_scout_options_apply_the_dry_run_before_the_vendor_maps(
+    stub_flux_cli, monkeypatch
+):
+    monkeypatch.delenv("FLUX_QUANTUM_MOCK", raising=False)
+    cli = importlib.import_module("flux_quantum.cli")
+    opts = cli.scout_options(_vendor(simulator="sim"), _make_args(quantum_dry_run=True))
+    assert opts["device"] == "sim" and opts["dry_run"] and opts["mapped"]
+    opts = cli.scout_options(_vendor(simulator="sim"), _make_args(quantum_device="qpu"))
+    assert opts["device"] == "qpu" and not opts["dry_run"]
+
+
+def test_a_hold_the_vendor_lacks_fails_at_submit(stub_flux_cli, monkeypatch):
+    """Before anything is held, with the vendor's explanation."""
+    from flux_quantum.backends import BackendError
+
+    monkeypatch.delenv("FLUX_QUANTUM_MOCK", raising=False)
+    cli = importlib.import_module("flux_quantum.cli")
+    with pytest.raises(BackendError, match="no probe hold"):
+        cli.scout_options(_vendor(), _make_args(quantum_hold="probe"))
+    with pytest.raises(BackendError, match="unknown hold"):
+        cli.scout_options(_vendor(), _make_args(quantum_hold="grab"))

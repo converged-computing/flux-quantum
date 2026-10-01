@@ -25,7 +25,7 @@ from flux.job import cancel, submit
 
 from . import graph, qresource
 from .selector import select_vendor, SelectionError, discover_registry_vendors
-from .backends import BackendError, get_backend, backend_classes
+from .backends import BackendError, get_backend
 from .launch import build_scout_jobspec
 
 # subcommands where quantum submission makes sense
@@ -215,6 +215,56 @@ def prepare_pair(
     return main_id
 
 
+def _opt(args, name):
+    """A plugin option off the parsed args, by its prefixed name first.
+
+    flux proxies args.device to args.quantum_device inside plugin callbacks,
+    but flux has options of its own and a bare name could be one of them.
+    """
+    for attr in ("quantum_" + name, name):
+        value = getattr(args, attr, None)
+        if value is not None:
+            return value
+    return None
+
+
+def common_options(args, jobspec=None, environ=None):
+    """The COMMON_OPTIONS from the parsed args, with their defaults.
+
+    The hold limit follows the job's duration when it has one, so setting a
+    walltime sets it. FLUX_QUANTUM_MOCK makes every submit a dry run, since
+    nothing in a mock run should reach a billed device.
+    """
+    environ = os.environ if environ is None else environ
+    duration = 0
+    if jobspec:
+        duration = (
+            jobspec.get("attributes", {}).get("system", {}).get("duration", 0) or 0
+        )
+    hold_max = _opt(args, "hold_max")
+    wait = _opt(args, "wait")
+    return {
+        "device": _opt(args, "device") or None,
+        "hold": _opt(args, "hold") or "session",
+        "hold_max": (
+            float(hold_max) if hold_max else float(duration + 300 if duration else 900)
+        ),
+        "wait": float(wait) if wait else 0.0,
+        "dry_run": bool(_opt(args, "dry_run"))
+        or bool(environ.get("FLUX_QUANTUM_MOCK")),
+    }
+
+
+def scout_options(backend, args, jobspec=None):
+    """What the scout is given for this vendor: the common options, made a
+    dry run if asked, then mapped by the backend. Raises BackendError for a
+    hold the vendor cannot take."""
+    common = common_options(args, jobspec)
+    if common["dry_run"]:
+        common = backend.dry_run(common)
+    return backend.scout_options(common)
+
+
 class QuantumCLIPlugin(CLIPlugin):
     """Select a quantum vendor at submit time and prepare the held job."""
 
@@ -234,11 +284,44 @@ class QuantumCLIPlugin(CLIPlugin):
             default=None,
             help="auto-select vendor: any | queue | cost",
         )
-        # let each registered vendor backend contribute its own options
-        # (namespaced, e.g. --quantum-ibm-backend, --quantum-mock-session), so a
-        # quantum submit can carry vendor-specific parameters for the scout.
-        for backend_cls in backend_classes():
-            backend_cls.add_options(self.add_option)
+        # the same options whichever vendor it is. Each backend maps them to
+        # its own terms, and operator tuning lives in FLUX_QUANTUM_* variables
+        self.add_option(
+            "--device",
+            metavar="NAME",
+            default=None,
+            help="the vendor's name for the device: a Braket ARN, an IonQ "
+            "backend, a QRMI resource id. Each vendor has a default",
+        )
+        self.add_option(
+            "--hold",
+            metavar="MODE",
+            default=None,
+            help="session takes the vendor's real hold, a hybrid job on "
+            "Braket, a session on IonQ and IBM, the default. probe submits a "
+            "front of queue job and holds nothing",
+        )
+        self.add_option(
+            "--hold-max",
+            metavar="SECONDS",
+            default=None,
+            help="give the hold up after this long, so a scout that is never "
+            "released stops costing. Default is the job's duration plus "
+            "300, or 900 when it has none",
+        )
+        self.add_option(
+            "--wait",
+            metavar="SECONDS",
+            default=None,
+            help="give up if the hold is not ours after this long, and cancel "
+            "the held job. Default 0, as long as the scout may run",
+        )
+        self.add_option(
+            "--dry-run",
+            action="store_true",
+            default=False,
+            help="run on the vendor's simulator. FLUX_QUANTUM_MOCK implies it",
+        )
         self._chosen = None
 
     def _is_quantum(self, args):
@@ -301,9 +384,9 @@ class QuantumCLIPlugin(CLIPlugin):
 
         try:
             backend = get_backend(vendor)
+            options = scout_options(backend, args, jobspec.jobspec) if backend else {}
         except BackendError as e:
             raise SystemExit("flux quantum: {}".format(e))
-        options = backend.scout_options(args) if backend else {}
         job_env = backend.job_environment(options) if backend else {}
         handle = flux.Flux()
         main_id = prepare_pair(

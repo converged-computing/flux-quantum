@@ -38,7 +38,7 @@ echo ""
 echo "=== 4. one quantum submit -> held classical + scout ==="
 SID="systest-$(date +%s)"
 ERR=$(mktemp)
-scout=$(flux submit --quantum-vendor mock --quantum-mock-session "$SID" -n1 \
+scout=$(FLUX_QUANTUM_MOCK_SESSION="$SID" flux submit --quantum-vendor mock -n1 \
         -- sh -c 'echo QUANTUM_SESSION=$QUANTUM_SESSION_ID' 2>"$ERR")
 sed 's/^/    /' "$ERR"
 main=$(grep -oE 'held classical job [0-9]+' "$ERR" | awk '{print $NF}')
