@@ -108,7 +108,7 @@ flux submit --quantum-vendor ionq --quantum-dry-run -n1 -- flux python examples/
 flux submit --quantum-vendor ionq --quantum-device qpu.forte-1 -n1 -- flux python examples/ionq/workload.py
 ```
 
-`python -m flux_quantum.backends.ionq.fake` runs a stand-in for the service, so the backend and the whole pipeline run with no key at all. `IONQ_API_URL` points the backend at it.
+`python -m flux_quantum.backends.ionq.fake` runs a stand-in for the service, so the backend and the whole pipeline run with no key at all. `IONQ_API_URL` points the backend at it. It listens on the loopback, so on an instance of more than one node start it with `--bind 0.0.0.0` and use the URL it prints, which the other nodes can reach. `FAKE_IONQ_QUEUE=30-90` gives it a device queue, seconds a job waits before it is served, which a started session's jobs skip, and `POST /fake/config` changes it while running.
 
 ## Braket priority probe
 

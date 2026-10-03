@@ -22,7 +22,11 @@ not the hold.
 
 Tuning, from the environment:
 
-    FLUX_QUANTUM_IONQ_SHOTS   shots for the warm-up job, 100
+    FLUX_QUANTUM_IONQ_SHOTS           shots for the warm-up job, 100
+    FLUX_QUANTUM_IONQ_COST_LIMIT_USD  a cost limit on every session opened,
+                                      none by default. IonQ ends the session
+                                      when its jobs reach it, so a session
+                                      nobody is watching cannot bill past it
 """
 
 import math
@@ -144,6 +148,9 @@ class IonQBackend(Backend):
                     "duration_limit_min": int(options.get("max_minutes") or 15)
                 },
             }
+            limit = tuning("ionq_cost_limit_usd")
+            if limit:
+                body["settings"]["cost_limit"] = {"unit": "usd", "value": float(limit)}
             try:
                 self._session = self.client.post("/sessions", body)["id"]
             except APIError as e:
@@ -153,9 +160,7 @@ class IonQBackend(Backend):
                     raise BackendError(
                         "ionq: this account cannot create a session on {} "
                         "(HTTP {}). Sessions are in beta. Ask IonQ, or hold "
-                        "with --quantum-hold probe".format(
-                            body["backend"], e.status
-                        )
+                        "with --quantum-hold probe".format(body["backend"], e.status)
                     )
                 print(
                     "ionq: {} refused a session (HTTP {}), holding with a "

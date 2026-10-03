@@ -5,6 +5,8 @@ against the fake server over real HTTP, so the request shapes are checked
 end to end: the header, the JSON, the paths.
 """
 
+import time
+
 import pytest
 
 
@@ -526,3 +528,71 @@ def test_the_lifecycle_without_sessions_falls_back_in_a_dry_run(fake_ionq, monke
     assert b.session_id(opened).startswith("job:")
     b.close_session(opened)
     assert state.sessions == {}
+
+
+# ---------------------------------------------------------------------------
+# the fake's device queue
+
+
+def test_the_fake_queue_holds_a_job_in_submitted_until_its_wait_is_up():
+    from flux_quantum.backends.ionq import fake
+
+    state = fake.State(queue="0.3")
+    _, made = state.create_job({"backend": "simulator"})
+    for _ in range(3):
+        assert state.get_job(made["id"])[1]["status"] == "submitted"
+    time.sleep(0.35)
+    assert state.get_job(made["id"])[1]["status"] == "ready"
+
+
+def test_a_started_sessions_jobs_skip_the_fake_queue():
+    """The session's first job queues like anyone's. Once it starts the
+    device is the session's, and the next job is served on arrival."""
+    from flux_quantum.backends.ionq import fake
+
+    state = fake.State(queue="0.3")
+    _, s = state.create_session({"backend": "qpu.forte-1"})
+    _, first = state.create_job({"backend": "qpu.forte-1", "session_id": s["id"]})
+    assert state.get_job(first["id"])[1]["status"] == "submitted"
+    time.sleep(0.35)
+    state.get_job(first["id"])
+    state.get_job(first["id"])
+    assert state.sessions[s["id"]]["active"]
+    _, second = state.create_job({"backend": "qpu.forte-1", "session_id": s["id"]})
+    assert state.get_job(second["id"])[1]["status"] == "ready"
+
+
+def test_the_fake_queue_is_a_range_and_backends_reports_its_mean(fake_ionq):
+    from flux_quantum.backends.ionq import Client, fake
+
+    assert fake.parse_queue("30-90") == (30.0, 90.0)
+    assert fake.parse_queue("30") == (30.0, 30.0)
+    assert fake.parse_queue("") == (0.0, 0.0)
+    state = fake.State(queue="30-90")
+    assert 30 <= state.queue_wait() <= 90
+    assert state.backend("qpu.forte-1")[1]["average_queue_time"] == 60
+
+    url, state = fake_ionq
+    c = Client("k", url)
+    assert c.get("/fake/config")["queue"] == "0-0"
+    assert c.post("/fake/config", {"queue": "5-10"})["queue"] == "5-10"
+    assert state.queue == (5.0, 10.0)
+    assert c.get("/backends/simulator")["average_queue_time"] == 7.5
+    made = c.post("/jobs", {"backend": "simulator"})
+    assert "queue" not in c.get("/jobs/%s" % made["id"])
+
+
+def test_a_cost_limit_from_the_environment_goes_on_the_session(fake_ionq, monkeypatch):
+    from flux_quantum.backends.ionq import IonQBackend
+
+    url, state = fake_ionq
+    monkeypatch.setenv("IONQ_API_KEY", "k")
+    monkeypatch.setenv("IONQ_API_URL", url)
+    monkeypatch.setenv("FLUX_QUANTUM_IONQ_COST_LIMIT_USD", "25")
+    b = IonQBackend()
+    b.open_session(b.scout_options({"device": "qpu.forte-1"}))
+    posted = [
+        body for m, path, body in state.requests if (m, path) == ("POST", "/sessions")
+    ]
+    assert posted[0]["settings"]["cost_limit"] == {"unit": "usd", "value": 25.0}
+    assert posted[0]["settings"]["duration_limit_min"] == 15

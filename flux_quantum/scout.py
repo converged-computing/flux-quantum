@@ -20,10 +20,10 @@ from flux_quantum.keys import SESSION_KEY  # noqa: F401  (re-exported)
 # takes an injectable so the unit tests can run without them.
 try:
     import flux
-    from flux.job import JobID, event_wait
+    from flux.job import JobID, event_watch_async
     from flux.job import cancel as flux_cancel
 except ImportError:
-    flux = JobID = event_wait = flux_cancel = None
+    flux = JobID = event_watch_async = flux_cancel = None
 
 
 def post_session(handle, jobid, session, rpc=None):
@@ -40,10 +40,55 @@ def post_session(handle, jobid, session, rpc=None):
 
 
 def wait_for_job(handle, jobid, waiter=None):
-    """Block until the job reaches clean."""
-    waiter = waiter or event_wait
-    # a failed job still reaches clean, and we close the session either way
-    waiter(handle, jobid, "clean", raiseJobException=False)
+    """Block until the job reaches clean. A failed job still reaches clean,
+    and the session is closed either way.
+
+    SIGTERM while waiting unwinds with SystemExit so the caller's finally
+    closes the session. The bindings' synchronous wait blocks inside the
+    reactor, where a Python signal handler never gets to run, and a
+    cancelled scout sat there until flux killed it with the session still
+    open. So the watch runs in the reactor with a signal watcher beside it.
+    """
+    if waiter is not None:
+        waiter(handle, jobid, "clean", raiseJobException=False)
+        return
+
+    outcome = {}
+
+    def on_event(future, *_):
+        try:
+            event = future.get_event()
+        except Exception as e:  # the eventlog is gone, or the job is unknown
+            outcome["error"] = e
+            handle.reactor_stop()
+            return
+        if event is None or event.name == "clean":
+            outcome["done"] = True
+            handle.reactor_stop()
+
+    def on_signal(h, _watcher, signum, _args):
+        outcome["signal"] = signum
+        h.reactor_stop()
+
+    future = event_watch_async(handle, jobid)
+    future.then(on_event)
+    watcher = handle.signal_watcher_create(signal.SIGTERM, on_signal)
+    watcher.start()
+    try:
+        handle.reactor_run()
+    finally:
+        watcher.stop()
+        # the reactor's handler is gone with the watcher, so the Python one
+        # covers the close that follows
+        _install_signal_handlers()
+        try:
+            future.cancel()
+        except Exception:
+            pass
+    if "signal" in outcome:
+        raise SystemExit("quantum-scout: received signal {}".format(outcome["signal"]))
+    if "error" in outcome:
+        raise outcome["error"]
 
 
 def abort_held(handle, jobid, why, cancel=None):
@@ -96,6 +141,12 @@ def main():
     )
     args = ap.parse_args()
 
+    # what the scout says has to survive a kill, so no block buffering
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+
     if flux is None:
         sys.exit(
             "quantum-scout: the flux bindings are not importable, run under flux python"
@@ -128,15 +179,19 @@ def main():
 
         # opening is not the same as having the device, so wait until it is ours
         # before letting the classical job start
+        # say which hold is being released, so a run can check the service
+        # afterwards even when nothing was ever memoed to the classical
         try:
             ok, why = backend.wait_for_priority(opts)
         except Exception as e:
             backend.close_session(session)
+            print("quantum-scout: closed {} session {}".format(args.vendor, session))
             abort_held(
                 h, jobid, "waiting for {} priority failed: {}".format(args.vendor, e)
             )
         if not ok:
             backend.close_session(session)
+            print("quantum-scout: closed {} session {}".format(args.vendor, session))
             abort_held(h, jobid, "{} never became ours: {}".format(args.vendor, why))
         print("quantum-scout: {}".format(why))
         # what the classical job needs may only exist once the device is

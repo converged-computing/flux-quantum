@@ -12,21 +12,36 @@ queued.
     python3 -m flux_quantum.backends.ionq.fake --port 8765
     IONQ_API_KEY=anything IONQ_API_URL=http://127.0.0.1:8765 ...
 
+It listens on the loopback. On an instance of more than one node, jobs run
+where the scheduler puts them, so --bind 0.0.0.0 listens on every interface
+and the URL printed is the address other nodes reach this one at.
+
 FAKE_IONQ_NO_SESSIONS=1 refuses POST /sessions with 404, which is what an
 account without the beta sees. FAKE_IONQ_STEPS is how many GETs a job spends
 in each state before moving on, default 1. FAKE_IONQ_SECONDS is the least
 time a job spends in each state, default 0, for timings that look like a
 device's.
+
+FAKE_IONQ_QUEUE is the device's queue: the seconds a job sits in submitted
+before it is served, a number or a range like 30-90 drawn per job. A job
+in a session that has started skips it, which is what a session buys: the
+session's first job queues like anyone's, and once it starts the device is
+the session's. /backends reports the mean as average_queue_time. The queue
+can be changed while running, POST /fake/config {"queue": "30-90"}, so an
+experiment can sweep it.
 """
 
 import argparse
 import datetime
 import json
 import os
+import random
+import socket
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs
 
 ORDER = ["submitted", "ready", "started", "completed"]
 
@@ -37,21 +52,68 @@ def _stamp(t=None):
     ).isoformat()
 
 
+def parse_queue(spec):
+    """A queue spec as (low, high) seconds: "30" is 30 to 30, "30-90" a range,
+    nothing is no queue."""
+    if spec is None:
+        return (0.0, 0.0)
+    spec = str(spec).strip()
+    if not spec:
+        return (0.0, 0.0)
+    if "-" in spec:
+        lo, hi = spec.split("-", 1)
+        lo, hi = float(lo), float(hi)
+        return (min(lo, hi), max(lo, hi))
+    return (float(spec), float(spec))
+
+
 class State:
-    def __init__(self, no_sessions=False, steps=1, seconds=0.0):
+    def __init__(self, no_sessions=False, steps=1, seconds=0.0, queue=None):
         self.jobs = {}
         self.sessions = {}
         self.no_sessions = no_sessions
         self.steps = max(1, int(steps))
         self.seconds = float(seconds)
+        self.queue = parse_queue(queue)
         self.requests = []
         self.lock = threading.Lock()
+
+    def queue_wait(self):
+        lo, hi = self.queue
+        return random.uniform(lo, hi) if hi > lo else lo
+
+    def config(self):
+        return {
+            "queue": "%g-%g" % self.queue,
+            "seconds": self.seconds,
+            "steps": self.steps,
+            "no_sessions": self.no_sessions,
+        }
+
+    def configure(self, body):
+        """Change the service while it runs, for a sweep. Jobs already
+        submitted keep the wait they were given."""
+        if "queue" in body:
+            self.queue = parse_queue(body["queue"])
+        if "seconds" in body:
+            self.seconds = float(body["seconds"])
+        if "steps" in body:
+            self.steps = max(1, int(body["steps"]))
+        if "no_sessions" in body:
+            self.no_sessions = bool(body["no_sessions"])
+        return 200, self.config()
 
     def create_job(self, body):
         jid = str(uuid.uuid4())
         session = body.get("session_id")
         if session and session not in self.sessions:
             return 404, {"error": "session not found"}
+        if session:
+            self._expire(session)
+            if self.sessions[session]["status"] == "ended":
+                return 400, {"error": "session has ended"}
+        # the device's queue, unless a started session already has the device
+        served = bool(session and self.sessions[session]["active"])
         self.jobs[jid] = {
             "id": jid,
             "status": "submitted",
@@ -66,6 +128,7 @@ class State:
             "execution_duration_ms": None,
             "polls": 0,
             "since": time.time(),
+            "queue": 0.0 if served else self.queue_wait(),
         }
         return 200, {"id": jid, "status": "submitted", "session_id": session}
 
@@ -75,10 +138,10 @@ class State:
             return 404, {"error": "job not found"}
         if job["status"] in ORDER and job["status"] != "completed":
             job["polls"] += 1
-            if (
-                job["polls"] >= self.steps
-                and time.time() - job["since"] >= self.seconds
-            ):
+            least = self.seconds
+            if job["status"] == "submitted":
+                least = max(least, job["queue"])
+            if job["polls"] >= self.steps and time.time() - job["since"] >= least:
                 job["polls"] = 0
                 job["since"] = time.time()
                 job["status"] = ORDER[ORDER.index(job["status"]) + 1]
@@ -92,7 +155,36 @@ class State:
                 elif job["status"] == "completed":
                     job["completed_at"] = _stamp()
                     job["execution_duration_ms"] = int(max(1.0, self.seconds) * 1000)
-        return 200, {k: v for k, v in job.items() if k not in ("polls", "since")}
+        return 200, {
+            k: v for k, v in job.items() if k not in ("polls", "since", "queue")
+        }
+
+    def job_cost(self, jid):
+        """GET /jobs/{id}/cost, shaped like the service's: the estimate and,
+        once the job ran, what was charged. Dry runs charge nothing."""
+        job = self.jobs.get(jid)
+        if job is None:
+            return 404, {"error": "job not found"}
+        # the service answers with only dry_run for a job that cost nothing
+        if job.get("backend") == "simulator":
+            return 200, {"dry_run": False}
+        est = self.estimate({"shots": job.get("shots") or 1})[1]["estimated_total_cost"]
+        charged = est if job["status"] == "completed" else 0.0
+        return 200, {
+            "dry_run": False,
+            "estimated_cost": {"value": est, "unit": "usd"},
+            "cost": {"value": charged, "unit": "usd"},
+        }
+
+    def list_jobs(self, params):
+        """GET /jobs, newest first, with the service's paging keys."""
+        limit = int(params.get("limit", 25))
+        jobs = sorted(self.jobs.values(), key=lambda j: j["submitted_at"], reverse=True)
+        view = [
+            {k: v for k, v in j.items() if k not in ("polls", "since", "queue")}
+            for j in jobs[:limit]
+        ]
+        return 200, {"jobs": view, "next": None}
 
     def cancel_job(self, jid):
         job = self.jobs.get(jid)
@@ -106,21 +198,42 @@ class State:
         if self.no_sessions:
             return 404, {"error": "not found"}
         sid = str(uuid.uuid4())
+        settings = body.get("settings") or {}
+        minutes = settings.get("duration_limit_min")
+        expires = time.time() + 60 * float(minutes) if minutes else None
         self.sessions[sid] = {
             "id": sid,
             "backend": body.get("backend"),
-            "settings": body.get("settings") or {},
+            "settings": settings,
             "status": "created",
             "active": False,
             "created_at": _stamp(),
             "started_at": None,
             "ended_at": None,
+            "expires_at": _stamp(expires) if expires else None,
+            "expires": expires,
         }
-        return 200, dict(self.sessions[sid])
+        return 200, self._session_view(sid)
+
+    def _session_view(self, sid):
+        return {k: v for k, v in self.sessions[sid].items() if k != "expires"}
+
+    def _expire(self, sid):
+        """A session past its duration limit ends, as the service's does."""
+        s = self.sessions.get(sid)
+        if (
+            s
+            and s["expires"]
+            and s["status"] != "ended"
+            and time.time() >= s["expires"]
+        ):
+            self.end_session(sid)
 
     def get_session(self, sid):
-        s = self.sessions.get(sid)
-        return (404, {"error": "session not found"}) if s is None else (200, dict(s))
+        if sid not in self.sessions:
+            return 404, {"error": "session not found"}
+        self._expire(sid)
+        return 200, self._session_view(sid)
 
     def end_session(self, sid):
         s = self.sessions.get(sid)
@@ -133,15 +246,44 @@ class State:
                 "failed",
             ):
                 job["status"] = "canceled"
-        return 200, dict(s)
+        return 200, self._session_view(sid)
+
+    # rates for GET /jobs/estimate, shaped like the service's answer. The
+    # minimum is what a direct account was quoted for a small circuit, and
+    # a small circuit never gets above it, so that is the price of a job
+    RATE = {"cost_model": "2QGE_operations", "job_cost_minimum": 25.79, "fake": True}
+
+    def estimate(self, params):
+        shots = int(params.get("shots", 1))
+        cost = self.RATE["job_cost_minimum"]
+        return 200, {
+            "input_values": {
+                "backend": params.get("backend"),
+                "type": "ionq.circuit.v1",
+                "qubits": int(params.get("qubits", 1)),
+                "shots": shots,
+                "1q_gates": int(params.get("1q_gates", 0)),
+                "2q_gates": int(params.get("2q_gates", 0)),
+                "error_mitigation": params.get("error_mitigation", "false"),
+            },
+            "estimated_at": _stamp(),
+            "estimated_total_cost": round(cost, 4),
+            "cost_unit": "usd",
+            "rate_information": dict(self.RATE),
+        }
 
     def backend(self, name):
+        lo, hi = self.queue
+        if hi > 0:
+            queue_time = (lo + hi) / 2
+        else:
+            queue_time = 0 if name == "simulator" else 600
         return 200, {
             "backend": name,
             "status": "available",
             "degraded": False,
             "qubits": 36,
-            "average_queue_time": 0 if name == "simulator" else 600,
+            "average_queue_time": queue_time,
         }
 
 
@@ -167,8 +309,12 @@ def make_handler(state):
             auth = self.headers.get("Authorization") or ""
             if not auth.startswith("apiKey ") or len(auth) <= len("apiKey "):
                 return self._reply(401, {"error": "unauthorized"})
-            parts = [p for p in self.path.split("?")[0].split("/") if p]
+            path, _, query = self.path.partition("?")
+            parts = [p for p in path.split("/") if p]
+            params = {k: v[0] for k, v in parse_qs(query).items()}
             body = self._body() if method in ("POST", "PUT") else {}
+            if parts in (["jobs", "estimate"], ["jobs"]) and method == "GET":
+                body = params
             with state.lock:
                 state.requests.append((method, "/" + "/".join(parts), body))
                 code, payload = self._dispatch(method, parts, body)
@@ -179,6 +325,12 @@ def make_handler(state):
                 return state.backend(parts[1])
             if parts == ["jobs"] and method == "POST":
                 return state.create_job(body)
+            if parts == ["jobs", "estimate"] and method == "GET":
+                return state.estimate(body)
+            if parts == ["jobs"] and method == "GET":
+                return state.list_jobs(body)
+            if parts[:1] == ["jobs"] and parts[2:] == ["cost"] and method == "GET":
+                return state.job_cost(parts[1])
             if parts[:1] == ["jobs"] and len(parts) == 2 and method == "GET":
                 return state.get_job(parts[1])
             if parts[:1] == ["jobs"] and parts[2:] == ["results"] and method == "GET":
@@ -191,6 +343,11 @@ def make_handler(state):
                 return state.get_session(parts[1])
             if parts[:1] == ["sessions"] and parts[2:] == ["end"] and method == "POST":
                 return state.end_session(parts[1])
+            # not IonQ's: the fake's own knobs, for a sweep
+            if parts == ["fake", "config"] and method == "GET":
+                return 200, state.config()
+            if parts == ["fake", "config"] and method == "POST":
+                return state.configure(body)
             return 404, {
                 "error": "no such route: {} {}".format(method, "/".join(parts))
             }
@@ -207,27 +364,62 @@ def make_handler(state):
     return Handler
 
 
-def serve(port=0, state=None):
+def serve(port=0, state=None, bind="127.0.0.1"):
     """Start serving in a thread. Returns (server, state). The port is
     server.server_address[1], which matters when 0 was asked for."""
     state = state or State(
         no_sessions=bool(os.environ.get("FAKE_IONQ_NO_SESSIONS")),
         steps=os.environ.get("FAKE_IONQ_STEPS", 1),
         seconds=os.environ.get("FAKE_IONQ_SECONDS", 0),
+        queue=os.environ.get("FAKE_IONQ_QUEUE"),
     )
-    server = HTTPServer(("127.0.0.1", port), make_handler(state))
+    server = HTTPServer((bind, port), make_handler(state))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, state
 
 
+def advertised(bind):
+    """The address to publish for a bind address. The loopback and a real
+    address are themselves. 0.0.0.0 is every interface, so publish the one
+    the default route leaves by, which is what the other nodes reach."""
+    if bind not in ("0.0.0.0", ""):
+        return bind
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # no packet is sent, this only picks the interface for the route
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument(
+        "--bind",
+        default="127.0.0.1",
+        help="address to listen on. 0.0.0.0 for every interface, so other "
+        "nodes of the instance reach it (default: the loopback)",
+    )
     args = ap.parse_args()
-    server, _ = serve(args.port)
+    server, state = serve(args.port, bind=args.bind)
     print(
-        "fake ionq listening on http://127.0.0.1:%d" % server.server_address[1],
+        "fake ionq listening on http://%s:%d"
+        % (advertised(args.bind), server.server_address[1]),
+        flush=True,
+    )
+    print(
+        "fake ionq: queue %ss, %gs per state, %d poll(s) per state%s"
+        % (
+            state.config()["queue"],
+            state.seconds,
+            state.steps,
+            ", no sessions" if state.no_sessions else "",
+        ),
         flush=True,
     )
     try:
