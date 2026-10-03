@@ -4,33 +4,46 @@
 Implements the handful of v0.4 calls the backend makes: backends, jobs,
 cancel, sessions and end. Jobs advance one state per GET, submitted to ready
 to started to completed, so a poll loop sees every state and nothing has to
-sleep. A session becomes active when a job inside it starts, and ending it
-cancels whatever is still queued.
+sleep, and they carry the service's timestamps, submitted_at, started_at and
+completed_at. A session goes created, started, ended, as the service's does,
+started when a job inside it starts, and ending it cancels whatever is still
+queued.
 
     python3 -m flux_quantum.backends.ionq.fake --port 8765
     IONQ_API_KEY=anything IONQ_API_URL=http://127.0.0.1:8765 ...
 
 FAKE_IONQ_NO_SESSIONS=1 refuses POST /sessions with 404, which is what an
 account without the beta sees. FAKE_IONQ_STEPS is how many GETs a job spends
-in each state before moving on, default 1.
+in each state before moving on, default 1. FAKE_IONQ_SECONDS is the least
+time a job spends in each state, default 0, for timings that look like a
+device's.
 """
 
 import argparse
+import datetime
 import json
 import os
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ORDER = ["submitted", "ready", "started", "completed"]
 
 
+def _stamp(t=None):
+    return datetime.datetime.fromtimestamp(
+        time.time() if t is None else t, datetime.timezone.utc
+    ).isoformat()
+
+
 class State:
-    def __init__(self, no_sessions=False, steps=1):
+    def __init__(self, no_sessions=False, steps=1, seconds=0.0):
         self.jobs = {}
         self.sessions = {}
         self.no_sessions = no_sessions
         self.steps = max(1, int(steps))
+        self.seconds = float(seconds)
         self.requests = []
         self.lock = threading.Lock()
 
@@ -47,7 +60,12 @@ class State:
             "session_id": session,
             "noise": body.get("noise"),
             "name": body.get("name"),
+            "submitted_at": _stamp(),
+            "started_at": None,
+            "completed_at": None,
+            "execution_duration_ms": None,
             "polls": 0,
+            "since": time.time(),
         }
         return 200, {"id": jid, "status": "submitted", "session_id": session}
 
@@ -57,15 +75,24 @@ class State:
             return 404, {"error": "job not found"}
         if job["status"] in ORDER and job["status"] != "completed":
             job["polls"] += 1
-            if job["polls"] >= self.steps:
+            if (
+                job["polls"] >= self.steps
+                and time.time() - job["since"] >= self.seconds
+            ):
                 job["polls"] = 0
+                job["since"] = time.time()
                 job["status"] = ORDER[ORDER.index(job["status"]) + 1]
-                sess = self.sessions.get(job["session_id"])
-                if sess and job["status"] == "started" and not sess["active"]:
-                    sess["active"] = True
-                    sess["status"] = "active"
-                    sess["started_at"] = "now"
-        return 200, {k: v for k, v in job.items() if k != "polls"}
+                if job["status"] == "started":
+                    job["started_at"] = _stamp()
+                    sess = self.sessions.get(job["session_id"])
+                    if sess and not sess["active"]:
+                        sess["active"] = True
+                        sess["status"] = "started"
+                        sess["started_at"] = _stamp()
+                elif job["status"] == "completed":
+                    job["completed_at"] = _stamp()
+                    job["execution_duration_ms"] = int(max(1.0, self.seconds) * 1000)
+        return 200, {k: v for k, v in job.items() if k not in ("polls", "since")}
 
     def cancel_job(self, jid):
         job = self.jobs.get(jid)
@@ -83,8 +110,9 @@ class State:
             "id": sid,
             "backend": body.get("backend"),
             "settings": body.get("settings") or {},
-            "status": "pending",
+            "status": "created",
             "active": False,
+            "created_at": _stamp(),
             "started_at": None,
             "ended_at": None,
         }
@@ -98,7 +126,7 @@ class State:
         s = self.sessions.get(sid)
         if s is None:
             return 404, {"error": "session not found"}
-        s["status"], s["active"], s["ended_at"] = "ended", False, "now"
+        s["status"], s["active"], s["ended_at"] = "ended", False, _stamp()
         for job in self.jobs.values():
             if job["session_id"] == sid and job["status"] not in (
                 "completed",
@@ -185,6 +213,7 @@ def serve(port=0, state=None):
     state = state or State(
         no_sessions=bool(os.environ.get("FAKE_IONQ_NO_SESSIONS")),
         steps=os.environ.get("FAKE_IONQ_STEPS", 1),
+        seconds=os.environ.get("FAKE_IONQ_SECONDS", 0),
     )
     server = HTTPServer(("127.0.0.1", port), make_handler(state))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
