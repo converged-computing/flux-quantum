@@ -13,6 +13,7 @@ from .base import (
     Signals,
     register,
     get_backend,  # noqa: F401
+    backend_class,  # noqa: F401
     known_vendors,
     backend_classes,
 )

@@ -20,18 +20,9 @@ flux submit --help 2>&1 | grep -E 'quantum' || { echo "FAIL: CLI plugin not disc
 
 echo ""
 echo "=== 1. load fluxion + qmanager (normal acquire, no load-file) ==="
-# rc1 loads three fluxion modules and feasibility sits between the other two,
-# so remove in reverse dependency order. Leaving feasibility running while
-# resource goes away kills it with a notify failure.
-flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
-flux module remove -f sched-fluxion-feasibility 2>/dev/null || true
-flux module remove -f sched-fluxion-resource 2>/dev/null || true
-flux module remove -f sched-simple 2>/dev/null || true
-flux module load sched-fluxion-resource
-# feasibility is what rejects an unsatisfiable request at ingest, which is the
-# gate the plugin relies on, so put it back rather than running without it.
-flux module load sched-fluxion-feasibility 2>/dev/null || true
-flux module load sched-fluxion-qmanager
+# fluxion with the coschedule policy and without feasibility, see fluxion.sh
+. "$HERE/tests/integration/fluxion.sh"
+ensure_fluxion || { echo "FAIL could not load fluxion"; exit 1; }
 echo "fluxion + qmanager loaded"
 
 echo ""

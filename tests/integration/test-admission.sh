@@ -40,6 +40,10 @@ submit_pair () {
 echo "=== build and load ==="
 make -s -C "$HERE/flux_quantum/jobtap" || { echo "FAIL build"; exit 1; }
 
+# a pair needs fluxion, and rc1 does not always load it
+. "$HERE/tests/integration/fluxion.sh"
+ensure_fluxion || { echo "FAIL could not load fluxion"; exit 1; }
+
 # add the vendor before anything is allocated. Growing the fluxion graph while
 # jobs hold resources breaks every later free and wedges the scheduler.
 flux python -m flux_quantum.populate mock >/dev/null 2>&1 \

@@ -267,7 +267,7 @@ class _FakeDevice:
         return [cls(a) for a in cls.fleet]
 
 
-def test_queue_depth_splits_normal_from_priority():
+def test_queue_depth_splits_normal_from_priority(braket_sdk):
     from flux_quantum.backends.braket import queue_depth
 
     _FakeDevice.fleet = {"arn:aws:braket:::device/qpu/x/y": (7, 3)}
@@ -275,7 +275,7 @@ def test_queue_depth_splits_normal_from_priority():
     assert (q["normal"], q["priority"], q["jobs"]) == (7, 3, 0)
 
 
-def test_only_qpus_with_work_waiting_are_offered():
+def test_only_qpus_with_work_waiting_are_offered(braket_sdk):
     """Priority means nothing on an idle device, and simulators never queue."""
     from flux_quantum.backends.braket import qpus_with_a_queue
 
@@ -333,7 +333,7 @@ def test_everyday_windows_are_understood():
     )
 
 
-def test_survey_puts_open_devices_first_and_skips_shut_ones():
+def test_survey_puts_open_devices_first_and_skips_shut_ones(braket_sdk):
     """The real case from a Monday afternoon. Aquila had 60 waiting and Garnet
     7, but both were shut, so only Forte was worth paying for."""
     import datetime
@@ -366,7 +366,7 @@ def test_windows_are_reported_readably():
     ]
 
 
-def test_queue_depth_survives_the_note_braket_appends():
+def test_queue_depth_survives_the_note_braket_appends(braket_sdk):
     """The jobs field is a string and sometimes carries a message, as in
     "0 (1 prioritized hybrid job running)". int() on that raised mid run,
     after a task had already been submitted and paid for."""
@@ -677,7 +677,7 @@ def _api_bound_client(seen):
     return Client()
 
 
-def test_filler_goes_in_without_a_token():
+def test_filler_goes_in_without_a_token(braket_sdk):
     """It is there to sit in the Normal queue. A token would put it in
     Priority, which is the queue we are trying to jump."""
     from probe_hold import make_queue
@@ -688,7 +688,7 @@ def test_filler_goes_in_without_a_token():
     assert seen["tokens"] == [None, None, None]
 
 
-def test_filler_is_cancelled_with_a_client_token():
+def test_filler_is_cancelled_with_a_client_token(braket_sdk):
     """CancelQuantumTask requires clientToken, unlike most calls. Without it
     the cleanup fails at the moment it matters."""
     from probe_hold import drain_queue, make_queue
@@ -739,7 +739,7 @@ def test_a_device_that_does_not_say_is_not_guessed_at():
     assert shots_range(type("D", (), {})()) is None
 
 
-def test_the_device_region_wins_over_the_environment():
+def test_the_device_region_wins_over_the_environment(braket_sdk):
     """A stale AWS_DEFAULT_REGION pointed the session at the wrong region, so
     the bucket polled for the token was the wrong one and the hold looked like
     it never started."""
@@ -803,7 +803,7 @@ def test_a_completed_task_is_not_reported_as_a_cancel_failure():
     assert said == []
 
 
-def test_filler_shots_are_separate_from_probe_shots():
+def test_filler_shots_are_separate_from_probe_shots(braket_sdk):
     """They want opposite things. Filler needs shots to occupy the device,
     probe tasks want few so the run stays cheap. Ten shot filler finished
     before the queue could be read, twice."""

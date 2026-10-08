@@ -81,6 +81,12 @@ WARMUP = {"qubits": 1, "gateset": "qis", "circuit": [{"gate": "h", "target": 0}]
 class IonQBackend(Backend):
     name = "ionq"
 
+    @classmethod
+    def missing_job_environment(cls, env):
+        if env.get("IONQ_API_KEY") or env.get("IONQ_API_TOKEN"):
+            return []
+        return ["IONQ_API_KEY"]
+
     def __init__(self, client=None):
         if client is None:
             key = os.environ.get("IONQ_API_KEY") or os.environ.get("IONQ_API_TOKEN")

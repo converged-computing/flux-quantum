@@ -25,7 +25,7 @@ from flux.job import cancel, submit
 
 from . import graph, qresource
 from .selector import select_vendor, SelectionError, discover_registry_vendors
-from .backends import BackendError, get_backend
+from .backends import BackendError, backend_class, get_backend, known_vendors
 from .launch import build_scout_jobspec
 
 # subcommands where quantum submission makes sense
@@ -110,6 +110,7 @@ def prepare_pair(
     wrap_path=None,
     scout_path=None,
     dry_run=False,
+    wait=0.0,
 ):
     """Submit the user work held, then rewrite the jobspec in place into the
     scout that releases it. Returns the id of the held job.
@@ -131,12 +132,16 @@ def prepare_pair(
         wrap_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wrap.py")
 
     classical = copy.deepcopy(jobspec.jobspec)
-    # the scout outlives the classical, so give it the same walltime plus slack.
-    # 0 means no limit and has to stay 0.
+    # The scout waits for the vendor for up to --quantum-wait, then outlives
+    # the classical, so its walltime is the wait plus the classical's plus
+    # slack. Shorter and flux would kill it mid-wait every time. 0 means no
+    # limit and has to stay 0.
     classical_duration = (
         classical.get("attributes", {}).get("system", {}).get("duration", 0) or 0
     )
-    scout_duration = 0 if not classical_duration else classical_duration + 300
+    scout_duration = (
+        0 if not classical_duration else classical_duration + int(wait or 0) + 300
+    )
     _wrap_commands(classical, wrap_path)
     sysattr = classical.setdefault("attributes", {}).setdefault("system", {})
     sysattr["hold"] = 1
@@ -420,6 +425,7 @@ class QuantumCLIPlugin(CLIPlugin):
             options=options,
             job_env=job_env,
             dry_run=dry_run,
+            wait=common_options(args, jobspec.jobspec)["wait"],
         )
         if dry_run:
             return
@@ -430,15 +436,39 @@ class QuantumCLIPlugin(CLIPlugin):
         )
 
     def validate(self, jobspec):
-        """Fail before submission when the vendor credentials are missing, so a
-        job is not dispatched only to fail after taking resources."""
+        """Refuse a vendor this plugin has no backend for, or a job whose
+        environment lacks the vendor's credentials.
+
+        This hook also runs in the job ingest validator, a process the broker
+        started, whose environment is the broker's and never carries a user's
+        credentials. So nothing is read from os.environ here. The jobspec
+        carries the environment the job will run with, and the credentials
+        are checked in that, by name.
+        """
         try:
             vendor = jobspec.getattr("system.quantum.vendor")
         except KeyError:
             return  # not a quantum job
+        cls = backend_class(vendor)
+        if cls is None:
+            raise ValueError(
+                "quantum: no backend for vendor '{}', known: {}".format(
+                    vendor, " ".join(sorted(known_vendors())) or "none"
+                )
+            )
+        # the environment the job will run with, copied from the submitting
+        # shell. The credentials have to be in it, since the scout and the
+        # classical job both read them from there.
         try:
-            backend = get_backend(vendor)
-        except BackendError as e:
-            raise ValueError(str(e))
-        if backend is None:
-            raise ValueError("quantum: no backend for vendor '{}'".format(vendor))
+            env = jobspec.getattr("system.environment") or {}
+        except KeyError:
+            env = {}
+        missing = cls.missing_job_environment(env)
+        if missing:
+            raise ValueError(
+                "quantum: the job's environment is missing {}. flux copies the "
+                "submitting shell's environment into the job, so export them "
+                "there, and check nothing like --env=-* filtered them out".format(
+                    ", ".join(missing)
+                )
+            )

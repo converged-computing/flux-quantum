@@ -35,16 +35,27 @@ t0=$(date +%s%N)
 kill -TERM "$pid"
 wait "$pid"; wrc=$?
 dt=$(( ($(date +%s%N) - t0) / 1000000 ))
-cat "$LOG" | sed 's/^/    /'
-grep -q "unwound: quantum-scout: received signal 15" "$LOG" && echo "  ok    unwound on SIGTERM" \
-    || { echo "  FAIL  did not unwind on SIGTERM (rc=$wrc)"; rc=1; }
-[ "$dt" -lt 3000 ] && echo "  ok    within ${dt}ms" || { echo "  FAIL  took ${dt}ms"; rc=1; }
+sed 's/^/    /' "$LOG"
+if grep -q "unwound: quantum-scout: received signal 15" "$LOG"; then
+    echo "  ok    unwound on SIGTERM"
+else
+    echo "  FAIL  did not unwind on SIGTERM (rc=$wrc)"; rc=1
+fi
+if [ "$dt" -lt 3000 ]; then
+    echo "  ok    within ${dt}ms"
+else
+    echo "  FAIL  took ${dt}ms"; rc=1
+fi
 flux cancel "$job" 2>/dev/null
 
 echo "=== 2. the wait returns when the job reaches clean ==="
 job=$(flux submit true)
 if timeout 30 bash -c "$(declare -f waiter); waiter $job" >"$LOG" 2>&1; then
-    grep -q "^returned" "$LOG" && echo "  ok    returned after clean" || { echo "  FAIL  no return"; cat "$LOG"; rc=1; }
+    if grep -q "^returned" "$LOG"; then
+        echo "  ok    returned after clean"
+    else
+        echo "  FAIL  no return"; cat "$LOG"; rc=1
+    fi
 else
     echo "  FAIL  the wait did not return"; cat "$LOG"; rc=1
 fi
@@ -56,5 +67,5 @@ if timeout 10 bash -c "$(declare -f waiter); waiter $job" >"$LOG" 2>&1 && grep -
 else
     echo "  FAIL  blocked or failed on a finished job"; cat "$LOG"; rc=1
 fi
-[ "$rc" = 0 ] && echo "=== PASS ===" || echo "=== FAIL ==="
+if [ "$rc" = 0 ]; then echo "=== PASS ==="; else echo "=== FAIL ==="; fi
 exit "$rc"

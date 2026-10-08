@@ -30,6 +30,10 @@ fi
 
 make -s -C "$HERE/flux_quantum/jobtap" || { echo "FAIL build"; exit 1; }
 
+# a pair needs fluxion, and rc1 does not always load it
+. "$HERE/tests/integration/fluxion.sh"
+ensure_fluxion || { echo "FAIL could not load fluxion"; exit 1; }
+
 # Add the vendor to the graph before anything is allocated. Growing the graph
 # while jobs hold resources corrupts fluxion, every later free fails, and the
 # instance stops scheduling entirely.

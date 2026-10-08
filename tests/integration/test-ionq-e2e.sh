@@ -36,13 +36,8 @@ flux submit --help 2>&1 | grep -q -- --quantum-dry-run || { echo "FAIL: no --qua
 
 echo ""
 echo "=== 2. load fluxion + qmanager ==="
-flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
-flux module remove -f sched-fluxion-feasibility 2>/dev/null || true
-flux module remove -f sched-fluxion-resource 2>/dev/null || true
-flux module remove -f sched-simple 2>/dev/null || true
-flux module load sched-fluxion-resource
-flux module load sched-fluxion-feasibility 2>/dev/null || true
-flux module load sched-fluxion-qmanager
+. "$HERE/tests/integration/fluxion.sh"
+ensure_fluxion || { echo "FAIL could not load fluxion"; exit 1; }
 
 echo ""
 echo "=== 3. one quantum submit -> held classical and scout ==="

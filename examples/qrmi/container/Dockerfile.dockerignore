@@ -1,0 +1,15 @@
+# Context is the repository root. Keep the scratch and the build trees out.
+.git
+.claude
+.devcontainer
+.vscode
+flux-sched
+flux_quantum.egg-info
+**/__pycache__
+**/*.pyc
+**/*.so
+*.jsonl
+*.log
+*.patch
+*.diff
+*.png

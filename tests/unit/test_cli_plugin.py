@@ -313,6 +313,28 @@ def test_scout_duration_covers_the_classical(stub_flux_cli):
     assert js.jobspec["attributes"]["system"]["duration"] > 3600
 
 
+def test_scout_duration_covers_the_wait_too(stub_flux_cli):
+    """The scout can wait --quantum-wait seconds for the vendor before the
+    classical even starts, so its walltime has to cover both, or flux kills
+    it mid-wait every time."""
+    from flux_quantum import cli
+
+    js = _fake_jobspec(["myprog"])
+    js.jobspec.setdefault("attributes", {}).setdefault("system", {})["duration"] = 60
+
+    cli.prepare_pair(
+        handle=None,
+        jobspec=js,
+        vendor="mock",
+        submit_fn=lambda h, j: 999,
+        populate_fn=lambda h, v: None,
+        get_graph_fn=lambda h: _live_graph(),
+        cancel_fn=lambda *a: None,
+        wait=1800,
+    )
+    assert js.jobspec["attributes"]["system"]["duration"] == 60 + 1800 + 300
+
+
 def test_unlimited_classical_keeps_scout_unlimited(stub_flux_cli):
     """duration 0 means no limit and must stay 0."""
     from flux_quantum import cli
@@ -509,6 +531,63 @@ def test_flux_dry_run_is_read_from_under_the_proxy(stub_flux_cli):
     assert cli.flux_dry_run(Proxy(_make_args(dry_run=True, quantum_dry_run=False)))
     assert not cli.flux_dry_run(Proxy(_make_args(dry_run=False, quantum_dry_run=True)))
     assert not cli.flux_dry_run(_make_args())
+
+
+def test_validate_checks_the_vendor_and_the_jobs_environment(
+    stub_flux_cli, monkeypatch
+):
+    """The hook also runs in the ingest validator, whose environment is the
+    broker's. Credentials are not there, so it checks the job's environment,
+    the one flux copied from the submitting shell."""
+    monkeypatch.delenv("FLUX_QUANTUM_MOCK", raising=False)
+    for name in [m for m in sys.modules if m.startswith("flux_quantum")]:
+        del sys.modules[name]
+    shim = _load_shim()
+    plugin = shim.QuantumCLIPlugin("submit")
+
+    class JS:
+        def __init__(self, attrs):
+            self.attrs = attrs
+
+        def getattr(self, key):
+            if key not in self.attrs:
+                raise KeyError(key)
+            return self.attrs[key]
+
+    creds = {
+        "QRMI_JOB_QPU_RESOURCES": "ibm_kingston",
+        "QRMI_JOB_QPU_TYPES": "qiskit-runtime-service",
+        "ibm_kingston_QRMI_IBM_QRS_ENDPOINT": "x",
+        "ibm_kingston_QRMI_IBM_QRS_IAM_ENDPOINT": "x",
+        "ibm_kingston_QRMI_IBM_QRS_IAM_APIKEY": "x",
+        "ibm_kingston_QRMI_IBM_QRS_SERVICE_CRN": "x",
+    }
+    # ibm is registered but has no credentials in this process. The job's
+    # environment has them, and that is what is checked.
+    plugin.validate(JS({"system.quantum.vendor": "ibm", "system.environment": creds}))
+    plugin.validate(JS({}))  # not a quantum job
+    with pytest.raises(ValueError, match="no backend for vendor 'rigetti'"):
+        plugin.validate(JS({"system.quantum.vendor": "rigetti"}))
+    # a job whose environment lacks one is refused, naming it
+    short = dict(creds)
+    del short["ibm_kingston_QRMI_IBM_QRS_IAM_APIKEY"]
+    with pytest.raises(ValueError, match="ibm_kingston_QRMI_IBM_QRS_IAM_APIKEY"):
+        plugin.validate(
+            JS({"system.quantum.vendor": "ibm", "system.environment": short})
+        )
+    # and one with no environment at all, as a job submitted with --env=-*
+    with pytest.raises(ValueError, match="missing"):
+        plugin.validate(
+            JS(
+                {
+                    "system.quantum.vendor": "ibm",
+                    "system.environment": {
+                        "QRMI_JOB_QPU_RESOURCES": "ibm_kingston",
+                        "QRMI_JOB_QPU_TYPES": "qiskit-runtime-service",
+                    },
+                }
+            )
+        )
 
 
 def test_common_options_have_defaults_and_follow_the_duration(

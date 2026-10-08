@@ -147,6 +147,17 @@ class Backend(ABC):
         """Env vars to add to the classical job, for example which QPU it has."""
         return {}
 
+    @classmethod
+    def missing_job_environment(cls, env):
+        """Names of the credential variables a job's environment lacks.
+
+        The ingest validator calls this with the environment the job will run
+        with, which flux copied from the submitting shell. Names only, never
+        values. A vendor whose credentials can come from somewhere other than
+        the environment, a file or an instance role, returns nothing.
+        """
+        return []
+
     def wait_for_priority(self, options=None):
         """Block until the vendor is actually ours, then return (ok, reason).
 
@@ -186,6 +197,13 @@ def get_backend(name):
     """
     cls = _REGISTRY.get(name)
     return cls() if cls else None
+
+
+def backend_class(name):
+    """Return the registered Backend subclass for a vendor, or None, without
+    constructing it. Construction checks credentials, which the ingest
+    validator does not have."""
+    return _REGISTRY.get(name)
 
 
 def known_vendors():

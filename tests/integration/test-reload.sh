@@ -27,6 +27,10 @@ if [ "$CORES" -lt 3 ]; then
     exit 0
 fi
 
+# a pair needs fluxion, and rc1 does not always load it
+. "$HERE/tests/integration/fluxion.sh"
+ensure_fluxion || { echo "FAIL could not load fluxion"; exit 1; }
+
 make -s -C "$HERE/flux_quantum/jobtap" || { echo "FAIL build"; exit 1; }
 flux python -m flux_quantum.populate mock >/dev/null 2>&1 \
     || echo "WARNING could not populate the graph up front"

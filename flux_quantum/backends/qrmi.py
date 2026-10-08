@@ -235,6 +235,24 @@ class QRMIBackend(Backend):
             "dry_run": bool(common.get("dry_run")),
         }
 
+    @classmethod
+    def missing_job_environment(cls, env):
+        """The job environment names its resources in QRMI_JOB_QPU_RESOURCES
+        and their types in QRMI_JOB_QPU_TYPES, so the variables each one needs
+        can be checked there. No resource named means nothing to check, and
+        open_session will say so."""
+        resources = [r for r in env.get("QRMI_JOB_QPU_RESOURCES", "").split(",") if r]
+        types = [t for t in env.get("QRMI_JOB_QPU_TYPES", "").split(",") if t]
+        missing = []
+        for i, resource in enumerate(resources):
+            rtype = types[i] if i < len(types) else cls.default_type
+            missing += [
+                resource + s
+                for s in REQUIRED_ENV.get(rtype, ())
+                if not env.get(resource + s)
+            ]
+        return missing
+
     def job_environment(self, options):
         """Tell the classical job which QPU it has, the same way the Slurm and
         LSF plugins do, so user code can call get_job_qpu_resources_and_types

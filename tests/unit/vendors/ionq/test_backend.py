@@ -229,14 +229,20 @@ def test_a_server_error_on_sessions_is_not_swallowed():
         IonQBackend(client=c).open_session({"target": "qpu.forte-1", "dry_run": True})
 
 
-def test_ready_once_the_session_is_active(capsys):
+def test_ready_once_the_warmup_is_served(capsys):
+    """IonQ marks a session active as soon as a job is submitted to it, so
+    the session's status is not the signal. The warm-up job starting is."""
     from flux_quantum.backends.ionq import IonQBackend
 
     c = Scripted(
         {
             ("POST", "/sessions"): {"id": "sess-1"},
             ("POST", "/jobs"): {"id": "job-1"},
-            ("GET", "/jobs/job-1"): [{"status": "submitted"}, {"status": "ready"}],
+            ("GET", "/jobs/job-1"): [
+                {"status": "submitted"},
+                {"status": "ready"},
+                {"status": "started"},
+            ],
             ("GET", "/sessions/sess-1"): [
                 {"status": "pending", "active": False},
                 {"status": "active", "active": True, "started_at": "t"},
@@ -246,8 +252,11 @@ def test_ready_once_the_session_is_active(capsys):
     b = IonQBackend(client=c)
     b.open_session({"target": "qpu.forte-1"})
     ok, why = b.wait_for_priority({}, interval=0, sleep=lambda _: None)
-    assert ok and "session active" in why
-    assert "session pending, warm-up job submitted" in capsys.readouterr().out
+    assert ok and "being served" in why
+    out = capsys.readouterr().out
+    assert "session pending, warm-up job submitted" in out
+    # active alone was not enough, it waited for the job to start
+    assert "session active, warm-up job ready" in out
 
 
 def test_a_started_warmup_counts_as_active_even_if_the_session_lags():
@@ -713,3 +722,11 @@ def test_a_started_sessions_jobs_wait_the_session_queue_not_the_public_one():
     _, k = state.create_job({"backend": "qpu.forte-1"})
     assert state.jobs[k["id"]]["queue"] == 10.0
     assert fake.State().session_queue == (0.0, 0.0)  # as the campaign ran
+
+
+def test_missing_job_environment_wants_the_key():
+    from flux_quantum.backends.ionq import IonQBackend
+
+    assert IonQBackend.missing_job_environment({"IONQ_API_KEY": "k"}) == []
+    assert IonQBackend.missing_job_environment({"IONQ_API_TOKEN": "k"}) == []
+    assert IonQBackend.missing_job_environment({}) == ["IONQ_API_KEY"]

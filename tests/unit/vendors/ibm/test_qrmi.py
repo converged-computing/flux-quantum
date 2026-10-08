@@ -325,3 +325,25 @@ def test_missing_qiskit_says_what_to_install(fake_qrmi, monkeypatch):
         b.wait_for_priority({})
     assert "qrmi[ibm]" in str(e.value)
     assert "SKIP_WARMUP" in str(e.value)
+
+
+def test_missing_job_environment_reads_the_jobs_resources():
+    """The validator has no credentials of its own. It asks the backend what
+    the job's environment lacks, by the resources named in it."""
+    from flux_quantum.backends.qrmi import QRMIBackend
+
+    class B(QRMIBackend):
+        name = "x"
+        default_type = "qiskit-runtime-service"
+
+    env = {
+        "QRMI_JOB_QPU_RESOURCES": RESOURCE,
+        "QRMI_JOB_QPU_TYPES": "qiskit-runtime-service",
+    }
+    assert B.missing_job_environment(dict(env, **CREDS)) == []
+    assert B.missing_job_environment({}) == []  # no resource named, nothing to check
+    short = dict(env, **CREDS)
+    del short[RESOURCE + "_QRMI_IBM_QRS_SERVICE_CRN"]
+    assert B.missing_job_environment(short) == [RESOURCE + "_QRMI_IBM_QRS_SERVICE_CRN"]
+    # the type falls back to the default when the types list is short
+    assert len(B.missing_job_environment({"QRMI_JOB_QPU_RESOURCES": RESOURCE})) == 4

@@ -15,14 +15,9 @@ SUB="${SUB:-/tmp/quantum-subgraph.json}"
 LIVE="${LIVE:-/tmp/live-graph.json}"
 
 echo "-- release preloaded scheduler; load fluxion + qmanager NORMALLY --"
-# reverse dependency order, feasibility sits between resource and qmanager
-flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
-flux module remove -f sched-fluxion-feasibility 2>/dev/null || true
-flux module remove -f sched-fluxion-resource 2>/dev/null || true
-flux module remove -f sched-simple 2>/dev/null || true
-flux module load sched-fluxion-resource
-flux module load sched-fluxion-feasibility 2>/dev/null || true
-flux module load sched-fluxion-qmanager
+# fluxion with the coschedule policy and without feasibility, see fluxion.sh
+. "$(dirname "$0")/fluxion.sh"
+ensure_fluxion || { echo "FAIL could not load fluxion"; exit 1; }
 
 echo "-- populate qdevice_<vendor> -> qpu into the live graph (find + add_subgraph RPC) --"
 flux python -c "
@@ -33,8 +28,11 @@ print('added vendors:', sorted(added))
 "
 
 echo "-- verify markers are discoverable via find --"
-found=$(flux ion-resource find --format=jgf status=up | sed -n '/^{/,$p' \
-        | grep -oE 'qdevice_[a-z_]+' | sort -u | tr '\n' ' ')
+# the same find RPC the plugin uses, so this does not need flux ion-resource
+found=$(flux python -c "
+import flux
+from flux_quantum import graph
+print(' '.join('qdevice_' + v for v in sorted(graph.vendors_present(graph.get_live_graph(flux.Flux())))))")
 echo "discoverable vendor types: $found"
 for v in $VENDORS; do
     case " $found " in

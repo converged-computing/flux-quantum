@@ -151,7 +151,8 @@ jobs:
           set -e
           flux module remove -f sched-simple 2>/dev/null || true
           flux module load sched-fluxion-resource match-format=rv1
-          flux module load sched-fluxion-qmanager
+          flux module load sched-fluxion-qmanager queue-policy=coschedule \
+            || flux module load sched-fluxion-qmanager
           export FLUX_CLI_PLUGINPATH=$PWD/cli-plugins
           bash tests/integration/test-system-instance.sh
           SH

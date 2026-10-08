@@ -9,6 +9,7 @@
 # start, and we wait so the qpu stays allocated for as long as the vendor
 # session is open.
 import argparse
+import errno
 import json
 import signal
 import sys
@@ -72,12 +73,16 @@ def wait_for_job(handle, jobid, waiter=None):
 
     future = event_watch_async(handle, jobid)
     future.then(on_event)
-    watcher = handle.signal_watcher_create(signal.SIGTERM, on_signal)
-    watcher.start()
+    watchers = []
+    for sig in (signal.SIGTERM, signal.SIGALRM):
+        watcher = handle.signal_watcher_create(sig, on_signal)
+        watcher.start()
+        watchers.append(watcher)
     try:
         handle.reactor_run()
     finally:
-        watcher.stop()
+        for watcher in watchers:
+            watcher.stop()
         # the reactor's handler is gone with the watcher, so the Python one
         # covers the close that follows
         _install_signal_handlers()
@@ -86,7 +91,7 @@ def wait_for_job(handle, jobid, waiter=None):
         except Exception:
             pass
     if "signal" in outcome:
-        raise SystemExit("quantum-scout: received signal {}".format(outcome["signal"]))
+        raise Signalled("quantum-scout: received signal {}".format(outcome["signal"]))
     if "error" in outcome:
         raise outcome["error"]
 
@@ -106,17 +111,186 @@ def abort_held(handle, jobid, why, cancel=None):
     sys.exit("quantum-scout: {}".format(why))
 
 
+class Signalled(SystemExit):
+    """Raised by the signal handlers, so an unwind can be told from an exit
+    the scout chose. SIGALRM is what flux sends when the walltime runs out."""
+
+
+# what flux and a user send to end a job, in the order they are tried
+SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGALRM)
+
+
 def _install_signal_handlers():
-    """Unwind on SIGTERM/SIGINT so the session still gets closed."""
+    """Unwind on SIGTERM, SIGINT and SIGALRM so the session still gets closed
+    and a held job that was never released is cancelled."""
 
     def _die(signum, frame):
-        raise SystemExit("quantum-scout: received signal {}".format(signum))
+        raise Signalled(
+            "quantum-scout: received signal {} ({})".format(
+                signum, signal.Signals(signum).name
+            )
+        )
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
+    for sig in SIGNALS:
         try:
             signal.signal(sig, _die)
         except (ValueError, OSError):
             pass
+
+
+def _release(handle, jobid):
+    handle.rpc("sched-fluxion-qmanager.release", {"id": jobid}).get()
+
+
+def run(
+    handle,
+    jobid,
+    vendor,
+    backend,
+    opts,
+    session=None,
+    no_wait=False,
+    cancel=None,
+    release=None,
+    post=None,
+    waiter=None,
+):
+    """Open the session, hand it over, release the held job, hold the qpu
+    until the classical is done, close the session.
+
+    Whatever ends this early, a vendor refusal, a failed RPC, or a signal,
+    including the SIGALRM flux sends at the walltime, leaves nothing behind:
+    the session is closed if it was opened, and the held job is cancelled if
+    it was never released. A classical job that is never released would
+    otherwise wait forever, and a session nobody uses would still bill.
+
+    The flux calls are injectable so this runs in the unit tests.
+    """
+    cancel = cancel or flux_cancel
+    release = release or _release
+    post = post or post_session
+    released = False
+    opened = None
+
+    def close():
+        nonlocal opened
+        if backend is None or opened is None:
+            return
+        try:
+            backend.close_session(opened)
+            print("quantum-scout: closed {} session {}".format(vendor, opened))
+        except Exception as e:  # do not mask an earlier failure
+            print(
+                "quantum-scout: WARNING failed to close {} session {}: {}".format(
+                    vendor, opened, e
+                ),
+                file=sys.stderr,
+            )
+        opened = None
+
+    try:
+        if session is None:
+            try:
+                session = backend.open_session(opts)
+            except Exception as e:
+                abort_held(
+                    handle,
+                    jobid,
+                    "opening {} session failed: {}".format(vendor, e),
+                    cancel,
+                )
+            opened = session
+
+            # opening is not the same as having the device, so wait until it
+            # is ours before letting the classical job start
+            try:
+                ok, why = backend.wait_for_priority(opts)
+            except Exception as e:
+                close()
+                abort_held(
+                    handle,
+                    jobid,
+                    "waiting for {} priority failed: {}".format(vendor, e),
+                    cancel,
+                )
+            if not ok:
+                close()
+                abort_held(
+                    handle,
+                    jobid,
+                    "{} never became ours: {}".format(vendor, why),
+                    cancel,
+                )
+            print("quantum-scout: {}".format(why))
+            # what the classical job needs may only exist once the device is
+            # held. Braket publishes its token after the hybrid job starts.
+            session = backend.session_id(session)
+
+        # must land before the release, or the job could start with no session
+        try:
+            post(handle, jobid, session)
+        except Exception as e:
+            abort_held(
+                handle,
+                jobid,
+                "could not post the session to job {}: {}".format(jobid, e),
+                cancel,
+            )
+
+        try:
+            release(handle, jobid)
+        except OSError as e:
+            if e.errno != errno.EINVAL:
+                abort_held(
+                    handle,
+                    jobid,
+                    "release failed for job {}: {}".format(jobid, e),
+                    cancel,
+                )
+            # EINVAL means the job is no longer pending: the queue policy did
+            # not hold it, so it was scheduled already. The session is on its
+            # eventlog, so it runs with it. Cancelling it would kill work that
+            # is using the session, so carry on and hold the qpu instead.
+            print(
+                "quantum-scout: WARNING job {} was not held, it is past pending "
+                "already. Is the qmanager queue-policy coschedule?".format(jobid),
+                file=sys.stderr,
+            )
+        except Exception as e:
+            abort_held(
+                handle, jobid, "release failed for job {}: {}".format(jobid, e), cancel
+            )
+        released = True
+        print(
+            "quantum-scout: vendor={} session={} unheld job={}".format(
+                vendor, session, jobid
+            )
+        )
+
+        if no_wait:
+            print("quantum-scout: --no-wait, not holding the session")
+        else:
+            wait_for_job(handle, jobid, waiter=waiter)
+            print("quantum-scout: classical job {} finished".format(jobid))
+    except Signalled as e:
+        if not released:
+            # cut short before the handoff, so the classical would never start
+            try:
+                cancel(handle, jobid, str(e))
+                print(
+                    "quantum-scout: cancelled held job {}".format(jobid),
+                    file=sys.stderr,
+                )
+            except Exception as ex:
+                print(
+                    "quantum-scout: WARNING could not cancel held job {}: {}".format(
+                        jobid, ex
+                    ),
+                    file=sys.stderr,
+                )
+        raise
+    finally:
+        close()
 
 
 def main():
@@ -157,9 +331,7 @@ def main():
 
     # --session bypasses the backend for testing
     backend = None
-    if args.session:
-        session = args.session
-    else:
+    if not args.session:
         try:
             backend = get_backend(args.vendor)
         except BackendError as e:
@@ -171,73 +343,21 @@ def main():
                 "no backend registered for vendor {}, set FLUX_QUANTUM_MOCK for "
                 "the mock vendor".format(args.vendor),
             )
-        opts = json.loads(args.options)
-        try:
-            session = backend.open_session(opts)
-        except Exception as e:
-            abort_held(h, jobid, "opening {} session failed: {}".format(args.vendor, e))
 
-        # opening is not the same as having the device, so wait until it is ours
-        # before letting the classical job start
-        # say which hold is being released, so a run can check the service
-        # afterwards even when nothing was ever memoed to the classical
-        try:
-            ok, why = backend.wait_for_priority(opts)
-        except Exception as e:
-            backend.close_session(session)
-            print("quantum-scout: closed {} session {}".format(args.vendor, session))
-            abort_held(
-                h, jobid, "waiting for {} priority failed: {}".format(args.vendor, e)
-            )
-        if not ok:
-            backend.close_session(session)
-            print("quantum-scout: closed {} session {}".format(args.vendor, session))
-            abort_held(h, jobid, "{} never became ours: {}".format(args.vendor, why))
-        print("quantum-scout: {}".format(why))
-        # what the classical job needs may only exist once the device is
-        # held. Braket publishes its token after the hybrid job starts.
-        session = backend.session_id(session)
-
-    # must land before the release, or the job could start with no session
-    try:
-        post_session(h, jobid, session)
-    except Exception as e:
-        abort_held(
-            h, jobid, "could not post the session to job {}: {}".format(args.job, e)
-        )
-
+    # From here a signal unwinds through run, which closes whatever is open
+    # and cancels the held job if it was never released. That covers the
+    # SIGALRM flux sends at the walltime, so a scout that runs out of time
+    # while waiting for the vendor cleans up the same way as one that gives up.
     _install_signal_handlers()
-    try:
-        try:
-            h.rpc("sched-fluxion-qmanager.release", {"id": jobid}).get()
-        except Exception as e:
-            sys.exit("quantum-scout: release failed for job {}: {}".format(args.job, e))
-
-        print(
-            "quantum-scout: vendor={} session={} unheld job={}".format(
-                args.vendor, session, args.job
-            )
-        )
-
-        if args.no_wait:
-            print("quantum-scout: --no-wait, not holding the session")
-        else:
-            wait_for_job(h, jobid)
-            print("quantum-scout: classical job {} finished".format(args.job))
-    finally:
-        if backend is not None:
-            try:
-                backend.close_session(session)
-                print(
-                    "quantum-scout: closed {} session {}".format(args.vendor, session)
-                )
-            except Exception as e:  # do not mask an earlier failure
-                print(
-                    "quantum-scout: WARNING failed to close {} session {}: {}".format(
-                        args.vendor, session, e
-                    ),
-                    file=sys.stderr,
-                )
+    run(
+        h,
+        jobid,
+        args.vendor,
+        backend,
+        json.loads(args.options),
+        session=args.session,
+        no_wait=args.no_wait,
+    )
 
 
 if __name__ == "__main__":
