@@ -42,43 +42,32 @@ def _wrap_commands(jobspec_dict, wrap_path):
 def _check_pair_fits(handle, classical, scout, rpc_fn=None):
     """Refuse a pair the graph can never hold, before either half exists.
 
-    The match_coschedule check in the add-hold branch is a satisfiability
-    test. Each half is checked alone against the whole graph with nothing
-    else on it, so this catches a missing qdevice or a half bigger than the
-    machine, not a busy machine. Fit against what is reachable right now is
-    the jobtap plugin's admission check.
+    Each half is checked alone against the whole graph through fluxion's
+    feasibility.check, which is what the job manager asks before it accepts
+    a job. This catches a missing qdevice or a half bigger than the machine,
+    not a busy machine. Fit against what is reachable right now is the
+    jobtap plugin's admission check.
     """
-    payload = {
-        "check": True,
-        "jobs": [
-            {"jobspec": scout, "op": "allocate"},
-            {"jobspec": classical, "op": "reserve"},
-        ],
-    }
     try:
-        if rpc_fn is None:
-            handle.rpc("sched-fluxion-resource.match_coschedule", payload).get()
-        else:
-            rpc_fn(handle, payload)
+        for half in (scout, classical):
+            payload = {"jobspec": half}
+            if rpc_fn is None:
+                handle.rpc("feasibility.check", payload).get()
+            else:
+                rpc_fn(handle, payload)
     except OSError as exc:
-        # ENODEV means the graph can never hold the pair. EBUSY would mean a
-        # fluxion that checks the live graph found no room now. Anything else
-        # means the question could not be asked, and that must not block a
-        # submit that worked before the check existed.
-        if exc.errno not in (errno.EBUSY, errno.ENODEV):
-            if exc.errno in (errno.EINVAL, errno.EPROTO):
-                print(
-                    "flux quantum: WARNING fluxion did not understand the pair "
-                    "check, skipping it: {}".format(exc),
-                    file=sys.stderr,
-                )
+        # ENODEV and EINVAL from feasibility.check mean the graph can never
+        # hold this half. Anything else means the question could not be
+        # asked, and that must not block a submit that worked before the
+        # check existed.
+        if exc.errno not in (errno.EBUSY, errno.ENODEV, errno.EINVAL):
             return
         raise SystemExit(
-            "flux quantum: this pair cannot be scheduled together on this "
-            "cluster. The classical half needs its cores and the scout needs "
-            "one more plus the vendor device, and the graph cannot hold both. "
-            "Submitting anyway would open a vendor session for a pair that "
-            "cannot run. ({})".format(exc)
+            "flux quantum: this pair cannot be scheduled on this cluster. The "
+            "classical half needs its cores and the scout needs one more plus "
+            "the vendor device, and the graph cannot hold both. Submitting "
+            "anyway would open a vendor session for a pair that cannot run. "
+            "({})".format(exc)
         )
     except Exception:
         # no usable handle, so there is nothing to ask
@@ -96,6 +85,17 @@ def _safe_cancel(cancel_fn, handle, jobid, reason):
         )
 
 
+def flux_dry_run(args):
+    """True when flux's own --dry-run is set, as opposed to --quantum-dry-run.
+
+    Inside a plugin callback flux hands us a proxy that aliases the bare
+    option names to ours, so args.dry_run is --quantum-dry-run there. Flux's
+    flag lives on the namespace underneath the proxy.
+    """
+    ns = getattr(args, "_ns", args)
+    return bool(getattr(ns, "dry_run", False))
+
+
 def prepare_pair(
     handle,
     jobspec,
@@ -109,9 +109,16 @@ def prepare_pair(
     cancel_fn=None,
     wrap_path=None,
     scout_path=None,
+    dry_run=False,
 ):
     """Submit the user work held, then rewrite the jobspec in place into the
     scout that releases it. Returns the id of the held job.
+
+    With dry_run nothing is submitted. The classical half is printed to
+    stderr, the jobspec is still rewritten into the scout with a placeholder
+    job id of 0, and flux prints that as it would any dry run. Without this,
+    flux's --dry-run skipped only flux's own submit and left a held job
+    parked with no scout to ever release it.
 
     flux submits whatever is left in the jobspec, so it submits the scout.
     The flux calls are injectable so this is testable without a broker.
@@ -172,17 +179,31 @@ def prepare_pair(
     if probe is not None:
         _check_pair_fits(handle, classical, probe)
 
-    # if feasibility validation is on, an unsatisfiable request is rejected here
-    # and we abort before spending any quantum quota
-    try:
-        main_id = int(submit_fn(handle, json.dumps(classical)))
-    except SystemExit:
-        raise
-    except Exception as exc:
-        raise SystemExit(
-            "flux quantum: classical request not accepted "
-            "(unsatisfiable, or ingest error): {}".format(exc)
+    if dry_run:
+        print(
+            "flux quantum: dry run, nothing submitted. The held classical job "
+            "would be:",
+            file=sys.stderr,
         )
+        print(json.dumps(classical, indent=2), file=sys.stderr)
+        print(
+            "flux quantum: and the scout, printed below by flux, would release "
+            "it. Its --job 0 stands in for the classical job id.",
+            file=sys.stderr,
+        )
+        main_id = 0
+    else:
+        # if feasibility validation is on, an unsatisfiable request is rejected
+        # here and we abort before spending any quantum quota
+        try:
+            main_id = int(submit_fn(handle, json.dumps(classical)))
+        except SystemExit:
+            raise
+        except Exception as exc:
+            raise SystemExit(
+                "flux quantum: classical request not accepted "
+                "(unsatisfiable, or ingest error): {}".format(exc)
+            )
 
     try:
         scout = build_scout_jobspec(
@@ -197,12 +218,13 @@ def prepare_pair(
     except SystemExit:
         raise
     except Exception as exc:
-        _safe_cancel(
-            cancel_fn,
-            handle,
-            main_id,
-            "flux quantum: aborting held classical (scout build failed)",
-        )
+        if not dry_run:
+            _safe_cancel(
+                cancel_fn,
+                handle,
+                main_id,
+                "flux quantum: aborting held classical (scout build failed)",
+            )
         raise SystemExit(
             "flux quantum: could not build the scout jobspec: {}".format(exc)
         )
@@ -389,9 +411,18 @@ class QuantumCLIPlugin(CLIPlugin):
             raise SystemExit("flux quantum: {}".format(e))
         job_env = backend.job_environment(options) if backend else {}
         handle = flux.Flux()
+        dry_run = flux_dry_run(args)
         main_id = prepare_pair(
-            handle, jobspec, vendor, scout_cores=1, options=options, job_env=job_env
+            handle,
+            jobspec,
+            vendor,
+            scout_cores=1,
+            options=options,
+            job_env=job_env,
+            dry_run=dry_run,
         )
+        if dry_run:
+            return
         print(
             "flux quantum: held classical job {} (vendor={}); this submit "
             "launches its scout".format(main_id, vendor),

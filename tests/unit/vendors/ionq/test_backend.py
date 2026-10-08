@@ -596,3 +596,120 @@ def test_a_cost_limit_from_the_environment_goes_on_the_session(fake_ionq, monkey
     ]
     assert posted[0]["settings"]["cost_limit"] == {"unit": "usd", "value": 25.0}
     assert posted[0]["settings"]["duration_limit_min"] == 15
+
+
+def test_without_a_warmup_the_scout_waits_on_the_session_alone(monkeypatch):
+    """A session that takes its place in the queue when it is created needs
+    no job to start, so the scout sends none and pays for none."""
+    from flux_quantum.backends.ionq import Client, IonQBackend, fake
+
+    state = fake.State(queue="0.3", session_start="queue")
+    server, _ = fake.serve(0, state=state)
+    try:
+        url = "http://127.0.0.1:%d" % server.server_address[1]
+        monkeypatch.setenv("IONQ_API_KEY", "k")
+        monkeypatch.setenv("IONQ_API_URL", url)
+        monkeypatch.setenv("FLUX_QUANTUM_IONQ_WARMUP", "0")
+        b = IonQBackend()
+        opts = b.scout_options({"device": "qpu.forte-1"})
+        sid = b.open_session(opts)
+        assert state.jobs == {}
+        ok, why = b.wait_for_priority(opts, interval=0.05)
+        assert ok, why
+        assert state.sessions[sid]["status"] == "started" and state.jobs == {}
+        # the session's first job is served on arrival
+        c = Client("k", url)
+        j = c.post("/jobs", {"backend": "qpu.forte-1", "session_id": sid})
+        assert c.get("/jobs/%s" % j["id"])["status"] == "ready"
+    finally:
+        server.shutdown()
+
+
+def test_the_default_session_start_is_the_first_job_as_the_campaign_ran():
+    from flux_quantum.backends.ionq import fake
+
+    state = fake.State(queue="0")
+    _, s = state.create_session({"backend": "qpu.forte-1"})
+    assert state.get_session(s["id"])[1]["status"] == "created"
+
+
+def test_the_scout_waits_for_the_warmup_to_run_not_for_the_session_status(monkeypatch):
+    """IonQ marks a session started when its first job is submitted. The
+    device is serving the session only when that job runs, so that is what
+    the scout waits for, or it would release the classical job too early."""
+    from flux_quantum.backends.ionq import IonQBackend, fake
+
+    state = fake.State(queue="0.3", session_start="submit")
+    server, _ = fake.serve(0, state=state)
+    try:
+        monkeypatch.setenv("IONQ_API_KEY", "k")
+        monkeypatch.setenv(
+            "IONQ_API_URL", "http://127.0.0.1:%d" % server.server_address[1]
+        )
+        monkeypatch.delenv("FLUX_QUANTUM_IONQ_WARMUP", raising=False)
+        b = IonQBackend()
+        opts = b.scout_options({"device": "qpu.forte-1"})
+        sid = b.open_session(opts)
+        assert state.sessions[sid]["status"] == "started"  # at submission, as IonQ does
+        (job,) = state.jobs.values()
+        assert job["status"] == "submitted"
+        t = time.time()
+        ok, why = b.wait_for_priority(opts, interval=0.05)
+        assert ok, why
+        assert time.time() - t >= 0.25  # it waited for the job, not the status
+        assert state.jobs[job["id"]]["status"] in ("started", "completed")
+    finally:
+        server.shutdown()
+
+
+def test_session_creation_retries_a_409_with_backoff():
+    from flux_quantum.backends.ionq import APIError, IonQBackend
+
+    class _Client:
+        url = "http://fake"
+
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, path, body=None):
+            self.calls += 1
+            if self.calls < 3:
+                raise APIError(409, "POST", path, b"session capacity full")
+            return {"id": "s-1"}
+
+    waits = []
+    b = IonQBackend(client=_Client())
+    got = b._create_session({"backend": "qpu.forte-1"}, sleep=waits.append)
+    assert got == {"id": "s-1"} and b.client.calls == 3
+    assert waits == [15.0, 22.5]
+
+
+def test_session_creation_gives_up_after_the_retries(monkeypatch):
+    from flux_quantum.backends.ionq import APIError, IonQBackend
+
+    class _Client:
+        url = "http://fake"
+
+        def post(self, path, body=None):
+            raise APIError(409, "POST", path, b"full")
+
+    monkeypatch.setenv("FLUX_QUANTUM_IONQ_SESSION_RETRIES", "2")
+    with pytest.raises(APIError) as e:
+        IonQBackend(client=_Client())._create_session(
+            {"backend": "qpu.forte-1"}, sleep=lambda _: None
+        )
+    assert e.value.status == 409
+
+
+def test_a_started_sessions_jobs_wait_the_session_queue_not_the_public_one():
+    """IonQ's session jobs do not skip the queue, they get a shorter one."""
+    from flux_quantum.backends.ionq import fake
+
+    state = fake.State(queue="10", session_queue="0.3", session_start="submit")
+    _, s = state.create_session({"backend": "qpu.forte-1"})
+    state.sessions[s["id"]]["active"] = True  # as if its first job had started
+    _, j = state.create_job({"backend": "qpu.forte-1", "session_id": s["id"]})
+    assert state.jobs[j["id"]]["queue"] == 0.3
+    _, k = state.create_job({"backend": "qpu.forte-1"})
+    assert state.jobs[k["id"]]["queue"] == 10.0
+    assert fake.State().session_queue == (0.0, 0.0)  # as the campaign ran

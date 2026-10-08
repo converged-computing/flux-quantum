@@ -22,13 +22,24 @@ in each state before moving on, default 1. FAKE_IONQ_SECONDS is the least
 time a job spends in each state, default 0, for timings that look like a
 device's.
 
-FAKE_IONQ_QUEUE is the device's queue: the seconds a job sits in submitted
-before it is served, a number or a range like 30-90 drawn per job. A job
-in a session that has started skips it, which is what a session buys: the
-session's first job queues like anyone's, and once it starts the device is
-the session's. /backends reports the mean as average_queue_time. The queue
+FAKE_IONQ_QUEUE is the device's public queue: the seconds a job sits in
+submitted before it is served, a number or a range like 30-90 drawn per job.
+A job in a session that has started waits FAKE_IONQ_SESSION_QUEUE instead,
+the session queue, 0 by default as the fake campaign ran. IonQ's sessions
+do not skip the queue: their jobs go into a separate queue with about half
+the device's capacity and wait a minute or two where the public queue is
+hours, so a faithful run sets both, say FAKE_IONQ_QUEUE=300 and
+FAKE_IONQ_SESSION_QUEUE=1-2, at whatever scale fits the time available. /backends reports the mean as average_queue_time. The queue
 can be changed while running, POST /fake/config {"queue": "30-90"}, so an
 experiment can sweep it.
+
+FAKE_IONQ_SESSION_START says how a session reaches started. job, the default
+and what the fake campaign ran with, starts it when its first job starts.
+submit is what IonQ does: the session is started the moment its first job
+is submitted, and the job then waits its turn, so a scout that trusts the
+session's status releases too early. queue starts the session by itself,
+one queue wait after it is created, with no job in it, which IonQ's do not;
+it models a service whose sessions queue alone.
 """
 
 import argparse
@@ -68,26 +79,42 @@ def parse_queue(spec):
 
 
 class State:
-    def __init__(self, no_sessions=False, steps=1, seconds=0.0, queue=None):
+    def __init__(
+        self,
+        no_sessions=False,
+        steps=1,
+        seconds=0.0,
+        queue=None,
+        session_start="job",
+        session_queue=None,
+    ):
         self.jobs = {}
         self.sessions = {}
         self.no_sessions = no_sessions
         self.steps = max(1, int(steps))
         self.seconds = float(seconds)
         self.queue = parse_queue(queue)
+        self.session_queue = parse_queue(session_queue)
+        self.session_start = session_start or "job"
+        if self.session_start not in ("job", "submit", "queue"):
+            raise ValueError(
+                "session_start is job, submit or queue, not %r" % self.session_start
+            )
         self.requests = []
         self.lock = threading.Lock()
 
-    def queue_wait(self):
-        lo, hi = self.queue
+    def queue_wait(self, which=None):
+        lo, hi = which if which is not None else self.queue
         return random.uniform(lo, hi) if hi > lo else lo
 
     def config(self):
         return {
             "queue": "%g-%g" % self.queue,
+            "session_queue": "%g-%g" % self.session_queue,
             "seconds": self.seconds,
             "steps": self.steps,
             "no_sessions": self.no_sessions,
+            "session_start": self.session_start,
         }
 
     def configure(self, body):
@@ -95,12 +122,18 @@ class State:
         submitted keep the wait they were given."""
         if "queue" in body:
             self.queue = parse_queue(body["queue"])
+        if "session_queue" in body:
+            self.session_queue = parse_queue(body["session_queue"])
         if "seconds" in body:
             self.seconds = float(body["seconds"])
         if "steps" in body:
             self.steps = max(1, int(body["steps"]))
         if "no_sessions" in body:
             self.no_sessions = bool(body["no_sessions"])
+        if "session_start" in body:
+            if body["session_start"] not in ("job", "submit", "queue"):
+                return 400, {"error": "session_start is job, submit or queue"}
+            self.session_start = body["session_start"]
         return 200, self.config()
 
     def create_job(self, body):
@@ -110,10 +143,17 @@ class State:
             return 404, {"error": "session not found"}
         if session:
             self._expire(session)
+            self._start(session)
             if self.sessions[session]["status"] == "ended":
                 return 400, {"error": "session has ended"}
         # the device's queue, unless a started session already has the device
         served = bool(session and self.sessions[session]["active"])
+        # IonQ marks the session started on its first submission. The job
+        # still waits its turn, so this does not make it served
+        if session and self.session_start == "submit":
+            sess = self.sessions[session]
+            if sess["status"] == "created":
+                sess["status"], sess["started_at"] = "started", _stamp()
         self.jobs[jid] = {
             "id": jid,
             "status": "submitted",
@@ -128,7 +168,9 @@ class State:
             "execution_duration_ms": None,
             "polls": 0,
             "since": time.time(),
-            "queue": 0.0 if served else self.queue_wait(),
+            "queue": (
+                self.queue_wait(self.session_queue) if served else self.queue_wait()
+            ),
         }
         return 200, {"id": jid, "status": "submitted", "session_id": session}
 
@@ -212,11 +254,32 @@ class State:
             "ended_at": None,
             "expires_at": _stamp(expires) if expires else None,
             "expires": expires,
+            # when the session starts by itself, under session_start=queue
+            "starts": (
+                time.time() + self.queue_wait()
+                if self.session_start == "queue"
+                else None
+            ),
         }
         return 200, self._session_view(sid)
 
     def _session_view(self, sid):
-        return {k: v for k, v in self.sessions[sid].items() if k != "expires"}
+        return {
+            k: v
+            for k, v in self.sessions[sid].items()
+            if k not in ("expires", "starts")
+        }
+
+    def _start(self, sid):
+        """A session queued for the device starts once its wait is up."""
+        s = self.sessions.get(sid)
+        if (
+            s
+            and s["status"] == "created"
+            and s.get("starts") is not None
+            and time.time() >= s["starts"]
+        ):
+            s["active"], s["status"], s["started_at"] = True, "started", _stamp()
 
     def _expire(self, sid):
         """A session past its duration limit ends, as the service's does."""
@@ -233,6 +296,7 @@ class State:
         if sid not in self.sessions:
             return 404, {"error": "session not found"}
         self._expire(sid)
+        self._start(sid)
         return 200, self._session_view(sid)
 
     def end_session(self, sid):
@@ -255,7 +319,12 @@ class State:
 
     def estimate(self, params):
         shots = int(params.get("shots", 1))
-        cost = self.RATE["job_cost_minimum"]
+        # the simulator is free; a small circuit on a QPU is the minimum
+        cost = (
+            0.0
+            if params.get("backend") == "simulator"
+            else self.RATE["job_cost_minimum"]
+        )
         return 200, {
             "input_values": {
                 "backend": params.get("backend"),
@@ -372,6 +441,8 @@ def serve(port=0, state=None, bind="127.0.0.1"):
         steps=os.environ.get("FAKE_IONQ_STEPS", 1),
         seconds=os.environ.get("FAKE_IONQ_SECONDS", 0),
         queue=os.environ.get("FAKE_IONQ_QUEUE"),
+        session_queue=os.environ.get("FAKE_IONQ_SESSION_QUEUE"),
+        session_start=os.environ.get("FAKE_IONQ_SESSION_START") or "job",
     )
     server = HTTPServer((bind, port), make_handler(state))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -413,11 +484,13 @@ def main():
         flush=True,
     )
     print(
-        "fake ionq: queue %ss, %gs per state, %d poll(s) per state%s"
+        "fake ionq: queue %ss, session queue %ss, %gs per state, %d poll(s) per state, sessions start on %s%s"
         % (
             state.config()["queue"],
+            state.config()["session_queue"],
             state.seconds,
             state.steps,
+            state.session_start,
             ", no sessions" if state.no_sessions else "",
         ),
         flush=True,

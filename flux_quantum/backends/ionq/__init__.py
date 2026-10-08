@@ -6,9 +6,19 @@ the endpoint, which is how the tests point it at the fake service in fake.py.
 Two ways to hold the device, set with --quantum-hold.
 
 session is the default. It creates a session on the backend and submits a one
-qubit warm-up job inside it. The scout is ready once IonQ reports the session
-active, which is when jobs carrying the session id are being served. The
-session id is what the classical job is handed. Sessions are in beta and only
+qubit warm-up job inside it. IonQ marks the session started when that first
+job is submitted, not when it runs, so the scout is ready when the warm-up
+job itself has started: that is when the device is serving the session. The
+session id is what the classical job is handed.
+
+What IonQ has told us about sessions, which the design leans on: a session
+does not start by itself, it needs a job. Its jobs go into a separate queue
+with about half the device's capacity, so they wait on the order of a minute
+or two rather than the public queue's hours. Any session that runs a job is
+billed a one hour minimum of device time when it ends, which no cost_limit
+caps, so one session per classical job is the expensive way to use them.
+duration_limit_min counts from creation. Creation returns 409 when the
+device's session capacity is full, and the scout retries that with backoff. Sessions are in beta and only
 some accounts have them, and a refusal says so plainly.
 
 probe submits the warm-up job alone and is ready once it has started. That
@@ -23,6 +33,16 @@ not the hold.
 Tuning, from the environment:
 
     FLUX_QUANTUM_IONQ_SHOTS           shots for the warm-up job, 100
+    FLUX_QUANTUM_IONQ_WARMUP          1, the default, sends a warm-up job into
+                                      the session and is ready when it starts.
+                                      0 sends nothing and waits on the session
+                                      status alone, which IonQ's sessions do
+                                      not reach by themselves, so it is for a
+                                      service that queues the session itself.
+                                      A probe hold always sends one
+    FLUX_QUANTUM_IONQ_SESSION_RETRIES how many times to retry a 409 on session
+                                      creation, the device's session capacity
+                                      being full, 20, with backoff from 15s
     FLUX_QUANTUM_IONQ_COST_LIMIT_USD  a cost limit on every session opened,
                                       none by default. IonQ ends the session
                                       when its jobs reach it, so a session
@@ -152,7 +172,7 @@ class IonQBackend(Backend):
             if limit:
                 body["settings"]["cost_limit"] = {"unit": "usd", "value": float(limit)}
             try:
-                self._session = self.client.post("/sessions", body)["id"]
+                self._session = self._create_session(body)["id"]
             except APIError as e:
                 if e.status not in (400, 401, 403, 404):
                     raise
@@ -168,10 +188,37 @@ class IonQBackend(Backend):
                     flush=True,
                 )
             else:
-                self._job = self._warmup(options, session=self._session)
+                if truthy(tuning("ionq_warmup", "1")):
+                    self._job = self._warmup(options, session=self._session)
+                else:
+                    self._job = None
+                    print(
+                        "ionq: session created, no warm-up, waiting on the session",
+                        flush=True,
+                    )
                 return self._session
         self._job = self._warmup(options)
         return self._job
+
+    def _create_session(self, body, sleep=time.sleep):
+        """POST /sessions, retrying a 409. IonQ answers 409 when the
+        device's session capacity is full, and a slot comes free when
+        someone's session ends, so wait and try again, backing off."""
+        retries = int(tuning("ionq_session_retries", 20))
+        wait = 15.0
+        for attempt in range(retries + 1):
+            try:
+                return self.client.post("/sessions", body)
+            except APIError as e:
+                if e.status != 409 or attempt == retries:
+                    raise
+                print(
+                    "ionq: session capacity on {} is full (HTTP 409), retry {} of {} "
+                    "in {:.0f}s".format(body["backend"], attempt + 1, retries, wait),
+                    flush=True,
+                )
+                sleep(wait)
+                wait = min(wait * 1.5, 300.0)
 
     def session_id(self, opened):
         """A session id goes over as is, since jobs are submitted into it. A
@@ -184,17 +231,19 @@ class IonQBackend(Backend):
     def wait_for_priority(self, options=None, interval=5.0, sleep=time.sleep):
         """Poll until the hold is real.
 
-        With a session, that is IonQ saying it is active, or the warm-up job
-        inside it having started, whichever is reported first. With a probe,
-        the warm-up job having started. A warm-up that fails or is cancelled
-        is a failure, not readiness.
+        With a session and a warm-up job, that is the warm-up job having
+        started: IonQ marks the session started as soon as its first job is
+        submitted, so the session's status says nothing about the device
+        serving it yet. Without a warm-up, the session's own status is all
+        there is. With a probe, the warm-up job having started. A warm-up
+        that fails or is cancelled is a failure, not readiness.
         """
         options = options or {}
         timeout = float(options.get("timeout") or 0)
         started = self._hold_started or time.time()
         deadline = started + timeout if timeout > 0 else None
         while True:
-            job = self.client.get("/jobs/{}".format(self._job))
+            job = self.client.get("/jobs/{}".format(self._job)) if self._job else {}
             status = job.get("status")
             waited = time.time() - started
             if status in ("failed", "canceled"):
@@ -208,12 +257,18 @@ class IonQBackend(Backend):
                     return False, "session {} before it became active".format(
                         s.get("status") or "ended"
                     )
-                if s.get("active") or s.get("started_at") or status in STARTED:
+                if self._job:
+                    ready = status in STARTED
+                else:
+                    ready = bool(s.get("active") or s.get("started_at"))
+                if ready:
                     self._hold_ready_after = waited
-                    return True, "session active after {:.0f}s".format(waited)
-                said = "session {}, warm-up job {}".format(
-                    s.get("status") or "pending", status
-                )
+                    return True, "session {} and being served after {:.0f}s".format(
+                        s.get("status") or "started", waited
+                    )
+                said = "session {}".format(s.get("status") or "pending")
+                if self._job:
+                    said += ", warm-up job {}".format(status)
             else:
                 if status in STARTED:
                     self._hold_ready_after = waited

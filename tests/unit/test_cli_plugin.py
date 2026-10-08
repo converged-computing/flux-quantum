@@ -392,35 +392,31 @@ def test_check_pair_fits_rejects_when_the_pair_cannot_be_placed(stub_flux_cli):
     from flux_quantum import cli
 
     def rpc(handle, payload):
-        raise OSError(errno.EBUSY, "the group does not fit right now")
+        raise OSError(errno.ENODEV, "unsatisfiable request")
 
     try:
         cli._check_pair_fits(None, {"a": 1}, {"b": 2}, rpc_fn=rpc)
     except SystemExit as exc:
-        assert "cannot be scheduled together" in str(exc)
+        assert "cannot be scheduled" in str(exc)
     else:
         raise AssertionError("a pair that cannot be placed was allowed through")
 
 
-def test_check_pair_fits_sends_both_halves_and_their_ops(stub_flux_cli):
-    """The question is about the pair, so both jobspecs go, the scout to be
-    allocated and the classical to be reserved. No jobids, since neither job
+def test_check_pair_fits_asks_feasibility_for_each_half(stub_flux_cli):
+    """Both jobspecs are checked, each on its own, through the same
+    feasibility question the job manager asks. No jobids, since neither job
     exists yet."""
     from flux_quantum import cli
 
-    seen = {}
+    seen = []
 
     def rpc(handle, payload):
-        seen.update(payload)
-        return {"fits": True}
+        seen.append(payload)
+        return {}
 
     cli._check_pair_fits(None, {"classical": 1}, {"scout": 1}, rpc_fn=rpc)
-    assert seen["check"] is True
-    ops = [j["op"] for j in seen["jobs"]]
-    assert sorted(ops) == ["allocate", "reserve"]
-    assert {"scout": 1} in [j["jobspec"] for j in seen["jobs"]]
-    assert {"classical": 1} in [j["jobspec"] for j in seen["jobs"]]
-    assert all("jobid" not in j for j in seen["jobs"])
+    assert [p["jobspec"] for p in seen] == [{"scout": 1}, {"classical": 1}]
+    assert all(set(p) == {"jobspec"} for p in seen)
 
 
 def test_check_pair_fits_is_permissive_when_it_cannot_ask(stub_flux_cli):
@@ -463,6 +459,56 @@ def test_prepare_pair_asks_before_submitting_anything(stub_flux_cli, monkeypatch
     # both halves were described to the check
     assert order[0][1] is not None and order[0][2] is not None
     assert any(x[0] == "submitted" for x in order)
+
+
+def test_flux_dry_run_submits_nothing(stub_flux_cli, capsys):
+    """flux --dry-run skips only flux's own submit. The classical half must
+    not be submitted either, or a held job is left parked with no scout."""
+    from flux_quantum import cli
+
+    def submit(handle, jobspec_json):
+        raise AssertionError("submitted the classical on a dry run")
+
+    def cancel(handle, jobid, reason):
+        raise AssertionError("cancelled a job that was never submitted")
+
+    js = _fake_jobspec(["myprog"])
+    main_id = cli.prepare_pair(
+        handle=None,
+        jobspec=js,
+        vendor="mock",
+        submit_fn=submit,
+        populate_fn=lambda h, v: None,
+        get_graph_fn=lambda h: _live_graph(),
+        cancel_fn=cancel,
+        dry_run=True,
+    )
+    assert main_id == 0
+    # the classical half is shown, and the jobspec is still the scout so flux
+    # prints that as the dry run output
+    err = capsys.readouterr().err
+    assert "nothing submitted" in err and '"hold": 1' in err
+    types = [r["type"] for r in js.jobspec["resources"]]
+    assert any(t.startswith("qdevice_") for t in types)
+    assert "--job" in js.jobspec["tasks"][0]["command"]
+
+
+def test_flux_dry_run_is_read_from_under_the_proxy(stub_flux_cli):
+    """Inside a callback args.dry_run is aliased to --quantum-dry-run, so
+    flux's own flag has to come from the namespace the proxy wraps."""
+    from flux_quantum import cli
+
+    class Proxy:
+        def __init__(self, ns):
+            object.__setattr__(self, "_ns", ns)
+
+        def __getattr__(self, name):
+            # the alias flux installs: dry_run -> quantum_dry_run
+            return getattr(self._ns, {"dry_run": "quantum_dry_run"}.get(name, name))
+
+    assert cli.flux_dry_run(Proxy(_make_args(dry_run=True, quantum_dry_run=False)))
+    assert not cli.flux_dry_run(Proxy(_make_args(dry_run=False, quantum_dry_run=True)))
+    assert not cli.flux_dry_run(_make_args())
 
 
 def test_common_options_have_defaults_and_follow_the_duration(
