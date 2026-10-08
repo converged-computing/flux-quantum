@@ -165,3 +165,78 @@ def test_classical_resource_fallback_no_core():
     }
     r = qr.classical_resource(empty)
     assert r["type"] == "node" and r["with"][0]["type"] == "slot"
+
+
+def test_count_cores_walks_the_resource_tree():
+    """The jobtap plugin budgets on this number, so it has to be right for the
+    shapes the plugin will actually see."""
+    from flux_quantum.qresource import count_cores
+
+    node_slot_core = {
+        "resources": [
+            {
+                "type": "node",
+                "count": 1,
+                "with": [
+                    {"type": "slot", "count": 8, "with": [{"type": "core", "count": 1}]}
+                ],
+            }
+        ]
+    }
+    assert count_cores(node_slot_core) == 8
+
+    # counts multiply down the tree
+    socketed = {
+        "resources": [
+            {
+                "type": "node",
+                "count": 2,
+                "with": [
+                    {
+                        "type": "socket",
+                        "count": 2,
+                        "with": [
+                            {
+                                "type": "slot",
+                                "count": 4,
+                                "with": [{"type": "core", "count": 1}],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    assert count_cores(socketed) == 16
+
+    # the qpu is not a core, so a scout jobspec counts as one
+    scout = {
+        "resources": [
+            {"type": "slot", "count": 1, "with": [{"type": "core", "count": 1}]},
+            {
+                "type": "qdevice_ibm",
+                "count": 1,
+                "with": [{"type": "qpu", "count": 1, "exclusive": True}],
+            },
+        ]
+    }
+    assert count_cores(scout) == 1
+
+    assert count_cores({"resources": []}) == 0
+    assert count_cores({}) == 0
+
+
+def test_count_cores_takes_the_minimum_of_a_range():
+    """A range means the job may get more, but only the minimum is promised."""
+    from flux_quantum.qresource import count_cores
+
+    ranged = {
+        "resources": [
+            {
+                "type": "slot",
+                "count": {"min": 2, "max": 8},
+                "with": [{"type": "core", "count": 1}],
+            }
+        ]
+    }
+    assert count_cores(ranged) == 2

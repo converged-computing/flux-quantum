@@ -1,0 +1,103 @@
+#!/bin/bash
+# Verify the stack from inside the instance, before spending anything.
+# Every check prints what it found. Hard failures make the exit code nonzero.
+#
+#   flux-quantum-check            inside flux-quantum-start
+#   flux-quantum-check --ibm      also check the IBM credentials by name
+set -u
+rc=0
+ok()   { echo "  ok   $*"; }
+bad()  { echo "  FAIL $*"; rc=1; }
+warn() { echo "  warn $*"; }
+
+echo "== versions =="
+flux version | sed 's/^/  /'
+flux python -c "import sys; print('  flux python', sys.version.split()[0], sys.executable)"
+flux python -c "import flux_quantum; print('  flux_quantum', flux_quantum.__file__)" || bad "flux_quantum is not importable from flux python"
+
+echo "== instance =="
+if flux resource list >/dev/null 2>&1; then
+    flux resource list | sed 's/^/  /'
+else
+    bad "no instance. Run this inside flux-quantum-start"; exit 1
+fi
+
+echo "== scheduler =="
+if flux module list | grep -qE "sched-fluxion-(resource|qmanager)"; then
+    ok "fluxion is the scheduler"
+else
+    bad "fluxion is not loaded, sched-simple cannot hold a job"
+fi
+policy=$(flux config get sched-fluxion-qmanager.queue-policy 2>/dev/null || true)
+if [ "$policy" = coschedule ]; then ok "queue-policy coschedule"; else bad "queue-policy is '${policy:-unset}', want coschedule"; fi
+
+echo "== jobtap plugin =="
+if flux jobtap list 2>/dev/null | grep -q quantum; then
+    ok "quantum.so loaded"
+    flux jobtap query quantum.so 2>/dev/null | flux python -c "
+import json, sys
+try:
+    q = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for k in ('vendors', 'protect_types', 'total_cores', 'reserve_cores', 'preempt_after'):
+    if k in q:
+        print('       {} = {}'.format(k, q[k]))
+"
+else
+    warn "quantum.so is not loaded, no admission control (flux dmesg | grep quantum)"
+fi
+
+echo "== cli plugin =="
+if flux submit --help 2>&1 | grep -q -- --quantum-vendor; then
+    ok "flux submit has the --quantum options (FLUX_CLI_PLUGINPATH=${FLUX_CLI_PLUGINPATH:-unset})"
+else
+    bad "no --quantum options. FLUX_CLI_PLUGINPATH=${FLUX_CLI_PLUGINPATH:-unset}"
+fi
+
+echo "== vendor devices in the graph =="
+# the same find RPC populate uses, so this works without the flux-sched
+# python commands installed
+found=$(flux python -c "
+import flux
+from flux_quantum import graph
+print(' '.join('qdevice_' + v for v in sorted(graph.vendors_present(graph.get_live_graph(flux.Flux())))))" 2>/dev/null)
+if [ -n "$found" ]; then ok "$found"; else bad "no qdevice vertices, run flux python -m flux_quantum.populate ibm mock"; fi
+
+echo "== qrmi =="
+if flux python -c "import qrmi, qiskit; print('  qrmi', getattr(qrmi, '__version__', '?'), 'qiskit', qiskit.__version__)" 2>/dev/null; then
+    ok "qrmi and qiskit import"
+    flux python -c "
+from qrmi import ResourceType
+print('       legacy ibm type present:', hasattr(ResourceType, 'IBMQiskitRuntimeService'))"
+else
+    bad "qrmi does not import. pip install 'qrmi[ibm]' needs python 3.11 or newer"
+fi
+if command -v ibmcloud >/dev/null; then
+    ok "ibmcloud $(ibmcloud version 2>/dev/null | head -1)"
+else
+    warn "no ibmcloud cli, set IBM_CLOUD_CRN by hand for ibm-run"
+fi
+
+echo "== mock vendor =="
+if [ -n "${FLUX_QUANTUM_MOCK:-}" ]; then ok "FLUX_QUANTUM_MOCK set, mock vendor registered"; else warn "FLUX_QUANTUM_MOCK unset, no token free rehearsal"; fi
+
+if [ "${1:-}" = "--ibm" ]; then
+    echo "== ibm credentials (names only, never values) =="
+    # constructing the backend is the check, it raises naming what is missing
+    if out=$(flux python -c "
+from flux_quantum.backends import get_backend
+print(get_backend('ibm').credential_note)" 2>&1); then
+        ok "$out"
+    else
+        bad "$(echo "$out" | tail -1)"
+    fi
+fi
+
+echo
+if [ "$rc" -eq 0 ]; then
+    echo "flux-quantum-check: all good"
+else
+    echo "flux-quantum-check: something is off, see FAIL above"
+fi
+exit "$rc"

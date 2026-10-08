@@ -44,6 +44,20 @@ def _base_graph():
     }
 
 
+def _idle_lister(ncores=0):
+    """A resource_list stand-in reporting ncores allocated."""
+
+    class _Alloc:
+        def __init__(self, n):
+            self.ncores = n
+
+    class _List:
+        def __init__(self, n):
+            self.allocated = _Alloc(n)
+
+    return lambda handle: _FakeRPC(_List(ncores))
+
+
 def test_get_live_graph_parses_find():
     h = _FakeHandle(_base_graph())
     g = qgraph.get_live_graph(h)
@@ -52,11 +66,27 @@ def test_get_live_graph_parses_find():
 
 def test_populate_adds_missing_vendor():
     h = _FakeHandle(_base_graph())
-    added = qgraph.populate(h, ["ibm"])
+    added = qgraph.populate(h, ["ibm"], lister=_idle_lister(0))
     assert added == {"ibm"}
     # one add_subgraph call carrying a qdevice_ibm vertex
     types = [n["metadata"]["type"] for n in h.added[0]["graph"]["nodes"]]
     assert "qdevice_ibm" in types and "qpu" in types
+
+
+def test_populate_refuses_when_the_allocation_is_unreadable():
+    """An unknown allocation count is not evidence the instance is idle."""
+
+    def _broken(handle):
+        raise RuntimeError("no scheduler")
+
+    h = _FakeHandle(_base_graph())
+    try:
+        qgraph.populate(h, ["ibm"], lister=_broken)
+    except RuntimeError as exc:
+        assert "could not be read" in str(exc)
+    else:
+        raise AssertionError("populate grew the graph without checking")
+    assert h.added == []
 
 
 def test_populate_is_idempotent():

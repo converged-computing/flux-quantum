@@ -5,11 +5,20 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "flux-quantum"
 version = "0.0.11"
-description = "Quantum + classical coscheduling components for Flux (CLI plugin, validator, jobtap, backends, scout)"
+description = "Quantum + classical coscheduling components for Flux (CLI plugin, jobtap, backends, scout)"
 requires-python = ">=3.8"
 # NOTE: interfaces (esp. flux.cli.plugin.CLIPlugin) are not yet stable across
 # flux-core releases. Developed/tested against flux-core 0.87.0. Pin to a
 # contemporaneous flux-core, per Flux packaging guidance.
+
+[project.scripts]
+# populate the graph once at startup. Growing it while jobs hold resources
+# corrupts fluxion, so this must run before any job does.
+flux-quantum-populate = "flux_quantum.populate:main"
+
+[project.optional-dependencies]
+# qrmi needs python 3.11 or newer, so it stays optional
+qrmi = ["qrmi[ibm]"]
 
 [project.urls]
 Homepage = "https://github.com/flux-framework"
@@ -18,6 +27,8 @@ Homepage = "https://github.com/flux-framework"
 include = ["flux_quantum*"]
 
 # The CLI plugin is discovered by flux from a *.py in the CLI plugin search
-# path, NOT by normal import. Install/symlink flux_quantum/cli_plugin.py into
-# one of: {confdir}/cli/plugins, {libexecdir}/cli/plugins, or a dir on
-# FLUX_CLI_PLUGINPATH. See README (Install).
+# path, NOT by normal import. Install/symlink cli-plugins/quantum.py (the shim
+# that imports QuantumCLIPlugin from the installed package) into one of:
+# {confdir}/cli/plugins, {libexecdir}/cli/plugins, or a dir on
+# FLUX_CLI_PLUGINPATH -- that dir must contain only the shim. See README
+# (Install).

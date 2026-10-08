@@ -24,7 +24,7 @@ VENDORS="mock ibm braket" bash "$SELF/setup-mock-registry.sh" || exit 1
 echo ""
 echo "=== 2. submit with --quantum-select any (NO explicit vendor) ==="
 # the plugin wraps the command itself, so do not pass wrap.py here
-scout_id=$(flux submit --quantum-select any --quantum-mock-session AUTOSESS456 -n1 \
+scout_id=$(FLUX_QUANTUM_MOCK_SESSION=AUTOSESS456 flux submit --quantum-select any -n1 \
         -- sh -c 'echo QUANTUM_SESSION=$QUANTUM_SESSION_ID' 2>"$ERR")
 main_id=$(grep -oE 'held classical job [0-9]+' "$ERR" | awk '{print $NF}')
 echo "scout=$scout_id  classical=$main_id"
@@ -75,6 +75,7 @@ fi
 
 # graceful teardown so shutdown does not log an acquire failure
 flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
+flux module remove -f sched-fluxion-feasibility 2>/dev/null || true
 flux module remove -f sched-fluxion-resource 2>/dev/null || true
 
 rm -f "$ERR"

@@ -1,0 +1,19 @@
+# What flux-quantum-start generates for flux start --config-path, kept here
+# so it can be read without starting anything. The terraform cluster writes
+# the same two tables to /etc/flux/system/conf.d/coschedule.toml and restarts
+# the system broker.
+
+# Reserve for held jobs. Under fcfs a held job is skipped and never reserves,
+# which is the one policy where coscheduling silently does not work.
+[sched-fluxion-qmanager]
+queue-policy = "coschedule"
+
+# Admission control. A pair reserves its cores plus one for the scout, and a
+# pair that would exceed the budget is rejected at submit rather than admitted
+# and left waiting with a vendor session already open. total_cores is the
+# whole instance. preempt_after is absent on purpose: with it the plugin may
+# cancel unprotected jobs to make room, and a cancelled job loses its work.
+[job-manager]
+plugins = [
+  { load = "/etc/flux/system/jobtap/quantum.so", conf = { vendors = "ibm,mock,braket,ionq", protect_types = "qpu", total_cores = 8, reserve_cores = 0 } }
+]

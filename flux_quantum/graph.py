@@ -17,6 +17,11 @@ import json
 
 from . import qresource
 
+try:
+    from flux.resource import resource_list
+except ImportError:
+    resource_list = None
+
 
 def get_live_graph(handle, criteria="status=up"):
     """Return the live fluxion graph of nodes and edges from the find RPC."""
@@ -52,10 +57,22 @@ def vendors_present(graph):
     return out
 
 
-def populate(handle, vendors, qpus=1, graph=None):
+def allocated_cores(handle, lister=None):
+    """Cores the scheduler currently has allocated."""
+    lister = lister or resource_list
+    if lister is None:
+        raise RuntimeError("the flux bindings are not importable")
+    return int(lister(handle).get().allocated.ncores)
+
+
+def populate(handle, vendors, qpus=1, graph=None, lister=None, force=False):
     """Ensure qdevice_<vendor> -> qpu exists in the live graph.
 
     Idempotent, only missing vendors are added. Returns what was added.
+
+    Growing the graph while jobs hold resources corrupts fluxion. Every later
+    free fails with planner_multi_rem_span returned -1 and the instance stops
+    scheduling. So a busy graph is refused unless force is set.
     """
     if isinstance(vendors, str):
         vendors = [vendors]
@@ -64,6 +81,29 @@ def populate(handle, vendors, qpus=1, graph=None):
     missing = [v for v in vendors if v not in vendors_present(graph)]
     if not missing:
         return set()
+
+    if not force:
+        # an unreadable allocation count is treated as busy
+        try:
+            busy = allocated_cores(handle, lister)
+        except Exception as exc:
+            raise RuntimeError(
+                "quantum: {} would have to be added to the fluxion graph, but "
+                "the allocated core count could not be read ({}), so there is "
+                "no way to tell whether the instance is idle. Growing a busy "
+                "graph breaks resource release for every running job. Populate "
+                "at startup with flux python -m flux_quantum.populate, or pass "
+                "force=True if you know the instance is "
+                "idle".format(", ".join(missing), exc)
+            )
+        if busy:
+            raise RuntimeError(
+                "quantum: {} would have to be added to the fluxion graph, but "
+                "{} cores are allocated. Growing the graph now would break "
+                "resource release for every running job and wedge the "
+                "scheduler. Populate at startup instead, with "
+                "flux python -m flux_quantum.populate".format(", ".join(missing), busy)
+            )
     subgraph = qresource.graph_subgraph(graph, missing, qpus=qpus)
     try:
         handle.rpc(
