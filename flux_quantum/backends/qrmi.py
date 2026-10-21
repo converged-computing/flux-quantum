@@ -96,6 +96,31 @@ def resources_in_environment(rtype):
     return sorted(k[: -len(suffix)] for k in os.environ if k.endswith(suffix))
 
 
+# IBM bills the two session modes differently. A dedicated session is billed
+# for wall clock from its first task until it closes, idle gaps included. A
+# batch session is billed for time on the hardware only. QRMI's own default
+# is dedicated, and a scout that waits even a minute between its warmup and
+# the classical job's circuit pays for that minute. So batch is the default
+# here, and dedicated is something an operator asks for.
+SESSION_MODES = ("batch", "dedicated")
+
+
+def session_mode(resource, rtype):
+    """Set the session mode for this resource and return it. An explicit
+    <resource>_QRMI_IBM_QRS_SESSION_MODE wins, then FLUX_QUANTUM_IBM_SESSION_MODE,
+    then batch. Only the qiskit-runtime-service type has modes."""
+    if rtype != "qiskit-runtime-service":
+        return None
+    name = resource + "_QRMI_IBM_QRS_SESSION_MODE"
+    mode = (os.environ.get(name) or tuning("ibm_session_mode") or "batch").lower()
+    if mode not in SESSION_MODES:
+        raise ValueError(
+            "{}: session mode must be batch or dedicated, not {}".format(resource, mode)
+        )
+    os.environ[name] = mode
+    return mode
+
+
 def missing_env(resource, rtype):
     """Return the variables this resource still needs."""
     return [s for s in REQUIRED_ENV.get(rtype, ()) if not os.environ.get(resource + s)]
@@ -277,6 +302,19 @@ class QRMIBackend(Backend):
             raise ValueError(
                 "{}: {} is missing {}".format(
                     self.name, resource, ", ".join(resource + s for s in missing)
+                )
+            )
+        mode = session_mode(resource, rtype)
+        if mode:
+            print(
+                "{}: session mode {}, {}".format(
+                    self.name,
+                    mode,
+                    (
+                        "billed for time on the hardware only"
+                        if mode == "batch"
+                        else "billed for wall clock until closed, idle time included"
+                    ),
                 )
             )
         self._resource = QuantumResource(resource, resource_type(rtype))

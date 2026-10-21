@@ -78,6 +78,8 @@ FLUX_QUANTUM_BRAKET_SHOTS           shots for the probe task, 1
 FLUX_QUANTUM_IONQ_SHOTS             shots for the warm-up job, 100
 FLUX_QUANTUM_IBM_TYPE               QRMI resource type, qiskit-runtime-service
 FLUX_QUANTUM_IBM_SKIP_WARMUP        release as soon as the session opens
+FLUX_QUANTUM_IBM_SESSION_MODE       batch, billed for hardware time only, or
+                                    dedicated, billed for wall clock until closed
 FLUX_QUANTUM_MOCK_SESSION           force the mock's session id
 FLUX_QUANTUM_MOCK_QUEUE             the mock's simulated queue depth
 ```

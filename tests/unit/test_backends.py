@@ -118,6 +118,36 @@ def test_mock_open_session_uses_options(monkeypatch):
     assert b.open_session({}).startswith("mock-session-")
 
 
+def test_session_mode_is_batch_unless_asked(fresh, monkeypatch):
+    """A dedicated session bills wall clock, idle gaps included, and it is
+    QRMI's own default. The backend sets batch unless the operator or the
+    environment says dedicated."""
+    import os
+
+    from flux_quantum.backends import qrmi as q
+
+    name = "ibm_kingston_QRMI_IBM_QRS_SESSION_MODE"
+    monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("FLUX_QUANTUM_IBM_SESSION_MODE", raising=False)
+    assert q.session_mode("ibm_kingston", "qiskit-runtime-service") == "batch"
+    assert os.environ[name] == "batch"
+
+    monkeypatch.setenv("FLUX_QUANTUM_IBM_SESSION_MODE", "dedicated")
+    monkeypatch.delenv(name)
+    assert q.session_mode("ibm_kingston", "qiskit-runtime-service") == "dedicated"
+
+    # a value already on the resource wins over the operator setting
+    monkeypatch.setenv(name, "batch")
+    assert q.session_mode("ibm_kingston", "qiskit-runtime-service") == "batch"
+
+    monkeypatch.setenv(name, "nonsense")
+    with pytest.raises(ValueError, match="batch or dedicated"):
+        q.session_mode("ibm_kingston", "qiskit-runtime-service")
+
+    # direct access has no session modes
+    assert q.session_mode("ibm_kingston", "ibm-quantum-system") is None
+
+
 def test_open_session_without_a_resource_is_explicit(fresh, monkeypatch):
     _fake_qrmi(monkeypatch)
     b = fresh(mock=False, env=IBM_CREDS)
