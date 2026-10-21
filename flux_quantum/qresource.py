@@ -15,6 +15,8 @@ the graph and the jobspec cannot disagree on type name, nesting or
 exclusivity. No flux imports, just dicts.
 """
 
+import uuid
+
 QDEVICE_PREFIX = "qdevice_"
 QPU = "qpu"
 
@@ -27,10 +29,8 @@ def qdevice_type(vendor):
 def jobspec_resource(vendor, nqpus=1):
     """A scout jobspec resources entry for the vendor device.
 
-    The qpu must be exclusive. Fluxion only adds a planner span and emits a
-    leaf device into R when it is asked for exclusively, since upd_plan calls
-    planner_add_span only inside the excl branch. Ask for it any other way and
-    it is matched but then dropped from the allocation.
+    The qpu must be exclusive. Fluxion only writes a leaf device into R when
+    it is asked for exclusively, otherwise it is matched and then dropped.
     """
     return {
         "type": qdevice_type(vendor),
@@ -144,3 +144,21 @@ def classical_resource(live_graph, ncores=1, label="scout"):
     for t in reversed(intermediates):
         inner = {"type": t, "count": 1, "with": [inner]}
     return {"type": "node", "count": 1, "with": [inner]}
+
+
+def count_cores(jobspec):
+    """Total cores a v1 jobspec asks for, multiplying counts down the tree."""
+
+    def walk(entries, factor):
+        total = 0
+        for entry in entries or []:
+            count = entry.get("count", 1)
+            if isinstance(count, dict):  # a range, take the minimum we must get
+                count = count.get("min", 1)
+            n = factor * int(count)
+            if entry.get("type") == "core":
+                total += n
+            total += walk(entry.get("with"), n)
+        return total
+
+    return walk(jobspec.get("resources"), 1)

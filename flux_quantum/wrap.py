@@ -11,7 +11,13 @@ import os
 import signal
 import sys
 
-from flux_quantum.scout import SESSION_KEY
+from flux_quantum.keys import ACQUISITION_TOKEN, SESSION_KEY
+
+try:
+    import flux
+    from flux.job import JobID, event_watch
+except ImportError:
+    flux = JobID = event_watch = None
 
 
 class _Timeout(Exception):
@@ -20,8 +26,7 @@ class _Timeout(Exception):
 
 def read_session(handle, jobid, timeout=60.0, watcher=None):
     """Return the session id the scout put on the eventlog for this job."""
-    if watcher is None:
-        from flux.job import event_watch as watcher
+    watcher = watcher or event_watch
 
     def _alarm(signum, frame):
         raise _Timeout()
@@ -42,14 +47,33 @@ def read_session(handle, jobid, timeout=60.0, watcher=None):
     raise RuntimeError("job eventlog ended without a session memo")
 
 
+def session_environment(session, resources=None):
+    """Return the env the wrapped program should see.
+
+    QRMI reads the acquisition token from <resource>_QRMI_JOB_ACQUISITION_TOKEN,
+    the same variable the Slurm and LSF plugins set. The resource names arrive
+    at submit time, the token only exists once the scout has acquired.
+    """
+    if resources is None:
+        resources = os.environ.get("QRMI_JOB_QPU_RESOURCES", "")
+    env = {"QUANTUM_SESSION_ID": session}
+    for resource in resources.split(","):
+        resource = resource.strip()
+        if resource:
+            env[resource + ACQUISITION_TOKEN] = session
+    return env
+
+
 def main():
     ap = argparse.ArgumentParser(prog="quantum-wrap")
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("command", nargs=argparse.REMAINDER)
     args = ap.parse_args()
 
-    import flux
-    from flux.job import JobID
+    if flux is None:
+        sys.exit(
+            "quantum-wrap: the flux bindings are not importable, run under flux python"
+        )
 
     fjid = os.environ.get("FLUX_JOB_ID")
     if not fjid:
@@ -60,7 +84,7 @@ def main():
     except Exception as e:
         sys.exit("quantum-wrap: {}".format(e))
 
-    os.environ["QUANTUM_SESSION_ID"] = session
+    os.environ.update(session_environment(session))
 
     cmd = args.command
     if cmd and cmd[0] == "--":

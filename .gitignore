@@ -1,2 +1,15 @@
 dist
 *.egg-info
+
+# never commit filled in credentials
+.env
+*.env
+!env.example
+
+# build and python artifacts
+__pycache__/
+*.pyc
+*.so
+
+# a sibling checkout the experiments live in
+flux-quantum-experiments/

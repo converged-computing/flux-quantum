@@ -85,11 +85,11 @@ jobs:
           flux start flux submit --help 2>&1 | grep -E -- '--quantum-vendor' \
             || { echo "CLI plugin not discovered"; exit 1; }
 
-      - name: vendor backends contribute their own options
+      - name: the submit options are the same for every vendor
         run: |
           export FLUX_CLI_PLUGINPATH=$PWD/cli-plugins
           out=$(flux start flux submit --help 2>&1)
-          for opt in --quantum-ibm-backend --quantum-braket-device --quantum-mock-session; do
+          for opt in --quantum-device --quantum-hold --quantum-hold-max --quantum-wait --quantum-dry-run; do
             echo "$out" | grep -q -- "$opt" || { echo "missing $opt"; exit 1; }
             echo "  $opt OK"
           done
@@ -111,6 +111,20 @@ jobs:
           SH
           flux start bash /tmp/jt.sh
 
+      # the core budget over unfinished pairs, rejecting a pair whose classical
+      # half could not be placed rather than admitting it
+      - name: jobtap admission control
+        run: FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-admission.sh
+
+      # preemption is destructive, so it runs on its own. Skips itself when the
+      # runner has fewer than three cores.
+      - name: jobtap preemption
+        run: FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-preemption.sh
+
+      # unload with a grace timer pending, and reload with jobs running
+      - name: jobtap unload and reload
+        run: FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-reload.sh
+
       # one submit gives a held classical and a scout, and the qpu stays
       # allocated until the classical is done
       - name: end-to-end, single broker
@@ -124,6 +138,12 @@ jobs:
       - name: vendor discovery + --quantum-select
         run: flux start bash tests/integration/test-select-discovery.sh
 
+      - name: IonQ backend end-to-end, against the fake service
+        run: flux start bash tests/integration/test-ionq-e2e.sh
+
+      - name: IonQ backend end-to-end, account without sessions
+        run: FAKE_IONQ_NO_SESSIONS=1 flux start bash tests/integration/test-ionq-e2e.sh
+
       # this test expects fluxion already loaded, as rc1 does on a real cluster
       - name: system-instance test (fluxion preloaded, 2 ranks)
         run: |
@@ -131,7 +151,8 @@ jobs:
           set -e
           flux module remove -f sched-simple 2>/dev/null || true
           flux module load sched-fluxion-resource match-format=rv1
-          flux module load sched-fluxion-qmanager
+          flux module load sched-fluxion-qmanager queue-policy=coschedule \
+            || flux module load sched-fluxion-qmanager
           export FLUX_CLI_PLUGINPATH=$PWD/cli-plugins
           bash tests/integration/test-system-instance.sh
           SH
