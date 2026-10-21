@@ -38,8 +38,12 @@ Build and load the jobtap plugin. `flux jobtap query quantum.so` shows the setti
 ```bash
 make -C flux_quantum/jobtap
 flux jobtap load $PWD/flux_quantum/jobtap/quantum.so vendors=ibm,braket,ionq \
-    total_cores=128 reserve_cores=32 protect_types=qpu preempt_after=30
+    total_cores=128 reserve_cores=32 protect_types=qpu preempt=1
 ```
+
+The plugin admits a pair only when its cores plus one for the scout are reachable, and only when a core is free right now for the scout, since nothing can be preempted for a pair until its scout runs and releases the classical half. Both halves run at `boost_priority` (default 1000, the scout one higher so it is placed before its classical reserves). A site with flux-accounting sets its own priorities and should load with `boost_priority=0`. Nothing then orders the scout ahead of its classical, which is an open gap for accounting sites and wants a factor inside flux-accounting rather than a second plugin.
+
+Preemption is off unless `preempt=1`. With it on, the plugin watches each classical half and cancels other work only when three things hold: the scout has released it, so the session is open and costing money; `settle` seconds later (default 2) it is still not running; and fluxion's annotation says it is reserved for later rather than placed. Then it cancels unprotected running jobs for the shortfall, the classical's cores less what is free, lowest priority first and youngest among equals, once per job. A cancelled job loses its work, which is why the switch is off by default.
 
 ## Submitting
 

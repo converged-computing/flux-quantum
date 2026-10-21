@@ -344,9 +344,26 @@ class QRMIBackend(Backend):
             input=json.dumps(warmup_payload(shots)), program_id="sampler"
         )
         task = self._resource.task_start(payload)
-        deadline = time.time() + timeout if timeout > 0 else None
+        print(
+            "{}: warmup task {} submitted, waiting for it to run".format(
+                self.name, task
+            ),
+            flush=True,
+        )
+        started = time.time()
+        deadline = started + timeout if timeout > 0 else None
+        last_status, last_report = None, started
         while True:
             status = self._resource.task_status(task)
+            # say something while queued, so an attached terminal sees life
+            if status != last_status or time.time() - last_report >= 30:
+                print(
+                    "{}: warmup task {} is {} after {:.0f}s".format(
+                        self.name, task, status, time.time() - started
+                    ),
+                    flush=True,
+                )
+                last_status, last_report = status, time.time()
             if status in (TaskStatus.Running, TaskStatus.Completed):
                 return True, "warmup task {} is {}".format(task, status)
             if status in (TaskStatus.Failed, TaskStatus.Cancelled):

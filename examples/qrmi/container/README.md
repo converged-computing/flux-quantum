@@ -95,13 +95,16 @@ $ flux jobtap query quantum.so | jq
   "path": "/etc/flux/system/jobtap/quantum.so",
   "total_cores": 16,
   "reserve_cores": 0,
-  "preempt_after": 0.0,
+  "preempt": false,
+  "settle": 2.0,
+  "boost_priority": 1000,
   "vendors": "ibm,mock,braket,ionq",
   "protect_types": "qpu",
   "free_cores": 16,
   "preemptible_cores": 0,
   "promised_cores": 0,
-  "tracked_jobs": 0
+  "tracked_jobs": 0,
+  "pending_decisions": 0
 }
 ```
 

@@ -40,7 +40,7 @@ try:
     q = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-for k in ('vendors', 'protect_types', 'total_cores', 'reserve_cores', 'preempt_after'):
+for k in ('vendors', 'protect_types', 'total_cores', 'reserve_cores', 'preempt', 'settle', 'boost_priority'):
     if k in q:
         print('       {} = {}'.format(k, q[k]))
 "

@@ -13,8 +13,8 @@
 # Tuning, all optional:
 #   TOTAL_CORES    cores the jobtap plugin budgets pairs against, nproc
 #   RESERVE_CORES  cores kept back from pairs, 0
-#   PREEMPT_AFTER  seconds before an unprotected job is cancelled to make
-#                  room. Unset means never, which is the safe default
+#   PREEMPT        1 lets the plugin cancel unprotected jobs to make room for
+#                  a released pair. Unset means never, the safe default
 #   VENDORS        comma separated allow list for the jobtap plugin, and
 #                  what gets populated into the graph: ibm,mock,braket,ionq
 #   QPUS           qpu vertices per vendor, the concurrency limit, 2
@@ -40,8 +40,8 @@ JOBTAP=${FLUX_QUANTUM_JOBTAP:-/etc/flux/system/jobtap/quantum.so}
 CONFDIR=${FLUX_QUANTUM_CONFDIR:-$HOME/.flux-quantum/conf.d}
 
 preempt=""
-if [ -n "${PREEMPT_AFTER:-}" ]; then
-    preempt=", preempt_after = ${PREEMPT_AFTER}"
+if [ -n "${PREEMPT:-}" ]; then
+    preempt=", preempt = ${PREEMPT}"
 fi
 
 mkdir -p "$CONFDIR"

@@ -11,8 +11,9 @@ queue-policy = "coschedule"
 # Admission control. A pair reserves its cores plus one for the scout, and a
 # pair that would exceed the budget is rejected at submit rather than admitted
 # and left waiting with a vendor session already open. total_cores is the
-# whole instance. preempt_after is absent on purpose: with it the plugin may
-# cancel unprotected jobs to make room, and a cancelled job loses its work.
+# whole instance. preempt is absent on purpose: with preempt = 1 the plugin
+# may cancel unprotected jobs to make room for a released pair, and a
+# cancelled job loses its work.
 [job-manager]
 plugins = [
   { load = "/etc/flux/system/jobtap/quantum.so", conf = { vendors = "ibm,mock,braket,ionq", protect_types = "qpu", total_cores = 8, reserve_cores = 0 } }

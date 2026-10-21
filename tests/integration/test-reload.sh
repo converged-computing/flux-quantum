@@ -1,8 +1,8 @@
 #!/bin/bash
-# Unload the plugin with a grace timer pending, then reload it with jobs
-# running. The timer must die with the plugin, and the reloaded plugin must
-# still see the running jobs, since job.new is replayed but job.state.run is
-# not.
+# Unload the plugin with a preemption decision pending, then reload it with
+# jobs running. The timer must die with the plugin, and the reloaded plugin
+# must still see the running jobs, since job.new is replayed but
+# job.state.run is not.
 #
 #     FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-reload.sh
 #
@@ -41,19 +41,20 @@ query () {
 
 load () {
     flux jobtap load "$PLUGIN" vendors="mock" total_cores="$CORES" \
-        reserve_cores=0 protect_types="qpu" preempt_after=4 \
+        reserve_cores=0 protect_types="qpu" preempt=1 settle=4 \
         || { echo "FAIL load"; exit 1; }
 }
 
 echo ""
-echo "=== fill every core with unprotected work ==="
+echo "=== fill all but one core with unprotected work ==="
+# the free core is for the scout, which has to run to release its partner
 load
 fill=""
-for _ in $(seq 1 "$CORES"); do
+for _ in $(seq 1 $((CORES - 1))); do
     id=$(flux submit -n1 sleep 600) && fill="$fill $id"
 done
 for _ in $(seq 1 20); do
-    [ "$(flux jobs -no '{state}' | grep -c RUN)" -eq "$CORES" ] && break
+    [ "$(flux jobs -no '{state}' | grep -c RUN)" -eq $((CORES - 1)) ] && break
     sleep 0.5
 done
 echo "  $(flux jobs -no '{state}' | grep -c RUN) running"
@@ -62,21 +63,31 @@ echo ""
 echo "=== the plugin reports what it sees ==="
 before=$(query)
 echo "$before" | sed 's/^/    /'
-if ! echo "$before" | grep -q '"preemptible_cores": *'"$CORES"; then
-    echo "FAIL expected $CORES preemptible cores with the machine full"
+if ! echo "$before" | grep -q '"preemptible_cores": *'"$((CORES - 1))"; then
+    echo "FAIL expected $((CORES - 1)) preemptible cores"
     rc=1
 fi
 
 echo ""
-echo "=== remove the plugin while a grace timer is pending ==="
-# the classical half reaching SCHED arms the timer, and cancelling the pair
-# afterwards leaves it armed with nothing promised
+echo "=== remove the plugin while a preemption decision is pending ==="
+# the scout's release arms the settle timer, and cancelling the pair before
+# it fires leaves it armed with nothing to decide
 err=$(mktemp)
 scout=$(flux submit --quantum-vendor mock -n1 -- true 2>"$err")
 main=$(grep -oE 'held classical job [0-9]+' "$err" | awk '{print $NF}')
 rm -f "$err"
 if [ -z "$main" ]; then
     echo "FAIL no pair was created"; exit 1
+fi
+if flux job wait-event -t 60 -m released=1 "$main" memo </dev/null >/dev/null 2>&1; then
+    echo "  the scout released its partner"
+else
+    echo "FAIL the scout never released its partner"; rc=1
+fi
+if query | grep -q '"pending_decisions": *1'; then
+    echo "  a decision is pending"
+else
+    echo "FAIL no decision pending after the release"; rc=1
 fi
 flux cancel "$main" "$scout" 2>/dev/null
 flux jobtap remove quantum.so || { echo "FAIL remove"; rc=1; }
@@ -96,12 +107,12 @@ echo "=== reload with jobs running: they must still count as running ==="
 load
 after=$(query)
 echo "$after" | sed 's/^/    /'
-if ! echo "$after" | grep -q '"preemptible_cores": *'"$CORES"; then
+if ! echo "$after" | grep -q '"preemptible_cores": *'"$((CORES - 1))"; then
     echo "FAIL after reload the running jobs are not counted, cores would be handed out twice"
     rc=1
 fi
-if ! echo "$after" | grep -q '"free_cores": *0'; then
-    echo "FAIL after reload the plugin thinks cores are free on a full machine"
+if ! echo "$after" | grep -q '"free_cores": *1'; then
+    echo "FAIL after reload the plugin does not see exactly one free core"
     rc=1
 fi
 
