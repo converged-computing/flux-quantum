@@ -190,6 +190,7 @@ def run(
 
     try:
         if session is None:
+            print("quantum-scout: opening a {} session".format(vendor))
             try:
                 session = backend.open_session(opts)
             except Exception as e:
@@ -294,6 +295,10 @@ def run(
 
 
 def main():
+    # stdout is a pipe under flux, so without this nothing shows in flux job
+    # attach until the scout exits, and a long vendor wait looks like a hang
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
     ap = argparse.ArgumentParser(prog="quantum-scout")
     ap.add_argument(
         "--job", required=True, help="classical (reservation) job id to release"

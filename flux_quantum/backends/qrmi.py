@@ -280,11 +280,13 @@ class QRMIBackend(Backend):
                 )
             )
         self._resource = QuantumResource(resource, resource_type(rtype))
+        print("{}: acquiring a session on {} ({})".format(self.name, resource, rtype))
         try:
             self._lock = self._resource.acquire()
         except Exception as e:
             self._resource = None
             raise RuntimeError(explain_acquire_failure(e, resource, rtype))
+        print("{}: acquired session {}".format(self.name, self._lock))
 
         # Hold nothing we cannot use. If the resource never becomes usable,
         # give the session back rather than letting the classical job start.
