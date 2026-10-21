@@ -44,10 +44,14 @@ make -s -C "$HERE/flux_quantum/jobtap" || { echo "FAIL build"; exit 1; }
 . "$HERE/tests/integration/fluxion.sh"
 ensure_fluxion || { echo "FAIL could not load fluxion"; exit 1; }
 
-# add the vendor before anything is allocated. Growing the fluxion graph while
-# jobs hold resources breaks every later free and wedges the scheduler.
-flux python -m flux_quantum.populate mock >/dev/null 2>&1 \
-    || echo "WARNING could not populate the graph up front"
+# The vendor must already be in the graph: the instance is started with the
+# static scheduling graph (run-with-static-graph.sh). Growing a live graph is
+# the thing that corrupted fluxion, and that path no longer exists.
+flux python -c "
+import flux
+from flux_quantum import graph
+assert 'mock' in graph.vendors_present(graph.get_live_graph(flux.Flux()))
+" 2>/dev/null || echo "WARNING qdevice_mock not in the graph; start me via run-with-static-graph.sh"
 
 # a one core pair reserves two, so a budget of four takes exactly two pairs
 flux jobtap load "$HERE/flux_quantum/jobtap/quantum.so" \

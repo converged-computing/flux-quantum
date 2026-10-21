@@ -12,7 +12,7 @@ branch of https://github.com/vsoch/flux-sched, and also loads against flux-core 
 - **flux_quantum/backends/** one module or package per vendor, IBM through QRMI, AWS Braket, IonQ over its REST API, and a mock. The common submit options are mapped to each vendor's terms there, so a user changes nothing but the vendor and the device. They probe queue depth and cost and open and close the session. They only ever run as the user.
 - **flux_quantum/selector.py** discovers vendors from the graph and ranks them by policy.
 - **flux_quantum/scout.py** and **wrap.py** the scout, and the wrapper that exports `QUANTUM_SESSION_ID` before the user's command runs.
-- **flux_quantum/graph.py**, **qresource.py**, **populate.py** add `qdevice_<vendor> -> qpu` to the fluxion graph.
+- **flux_quantum/schedjgf.py**, **qresource.py**, **graph.py** generate the static scheduling graph (real nodes and cores plus `qdevice_<vendor> -> qpu`) and read the live one. The graph is never mutated at runtime.
 - **flux_quantum/jobtap/quantum.c** owner side policy in the job manager. Allowed vendors, admission against reachable cores, protection of both halves, and optional preemption. Holds no credentials.
 
 ## Install
@@ -27,10 +27,23 @@ flux submit --help | grep quantum
 
 `cli-plugins/` contains only `quantum.py`, a shim that imports the installed package. Do not point `FLUX_CLI_PLUGINPATH` at `flux_quantum/` itself, or flux tries to import every module as a plugin. For a system install copy the shim into `{confdir}/cli/plugins`.
 
-Populate the graph once, before any job runs. Growing it while jobs hold resources corrupts fluxion.
+Give the broker a complete scheduling graph before it starts. The graph is
+static: fluxion receives it through `resource.acquire` at startup
+(qdevices included, so `sched-fluxion-feasibility` bootstraps itself from
+notify), and nothing ever mutates it. There is no populate step; growing a
+live graph is what used to corrupt fluxion, and that path no longer exists.
 
 ```bash
-flux python -m flux_quantum.populate ibm braket ionq
+flux python -m flux_quantum.schedjgf ibm braket ionq --qpus 4 \
+    --from-r /etc/flux/system/R --output /etc/flux/system/scheduling.json
+```
+
+and in the broker's config, next to `path`:
+
+```toml
+[resource]
+path = "/etc/flux/system/R"
+scheduling = "/etc/flux/system/scheduling.json"
 ```
 
 Build and load the jobtap plugin. `flux jobtap query quantum.so` shows the settings in force and the capacity numbers.
@@ -78,6 +91,8 @@ FLUX_QUANTUM_BRAKET_SHOTS           shots for the probe task, 1
 FLUX_QUANTUM_IONQ_SHOTS             shots for the warm-up job, 100
 FLUX_QUANTUM_IBM_TYPE               QRMI resource type, qiskit-runtime-service
 FLUX_QUANTUM_IBM_SKIP_WARMUP        release as soon as the session opens
+FLUX_QUANTUM_IBM_SESSION_MODE       batch, billed for hardware time only, or
+                                    dedicated, billed for wall clock until closed
 FLUX_QUANTUM_MOCK_SESSION           force the mock's session id
 FLUX_QUANTUM_MOCK_QUEUE             the mock's simulated queue depth
 ```
@@ -88,17 +103,21 @@ FLUX_QUANTUM_MOCK_QUEUE             the mock's simulated queue depth
 
 ```bash
 pytest tests/unit
-flux start bash tests/integration/test-mock-e2e.sh              # one submit, held classical and scout, handoff
-flux start -s2 bash tests/integration/test-mock-e2e.sh          # the two halves on different ranks
-FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-admission.sh    # jobtap admission
-FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-preemption.sh   # jobtap preemption
-FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-reload.sh       # jobtap unload and reload
-flux start bash tests/integration/test-select-discovery.sh      # vendors discovered from the graph
-flux start bash tests/integration/test-ionq-e2e.sh              # the IonQ backend against a fake api.ionq.co
-bash tests/integration/test-system-instance.sh                  # against a running instance
+# run=tests/integration/run-with-static-graph.sh, which starts a throwaway
+# instance carrying the static scheduling graph: <size> <vendors> <qpus> <cmd>
+run='bash tests/integration/run-with-static-graph.sh'
+FLUX_QUANTUM_MOCK=1 $run 2 mock 2 bash tests/integration/test-static-graph.sh  # the graph itself, end to end
+$run 1 "mock ibm braket ionq" 2 bash tests/integration/test-mock-e2e.sh        # one submit, held classical and scout, handoff
+$run 2 "mock ibm braket ionq" 2 bash tests/integration/test-mock-e2e.sh        # the two halves on different ranks
+FLUX_QUANTUM_MOCK=1 $run 1 "mock ibm braket ionq" 2 bash tests/integration/test-admission.sh   # jobtap admission
+FLUX_QUANTUM_MOCK=1 $run 1 "mock ibm braket ionq" 2 bash tests/integration/test-preemption.sh  # jobtap preemption
+FLUX_QUANTUM_MOCK=1 $run 1 "mock ibm braket ionq" 2 bash tests/integration/test-reload.sh      # jobtap unload and reload
+$run 1 "mock ibm braket" 2 bash tests/integration/test-select-discovery.sh     # vendors discovered from the graph
+$run 1 "mock ibm braket ionq" 2 bash tests/integration/test-ionq-e2e.sh        # the IonQ backend against a fake api.ionq.co
+bash tests/integration/test-system-instance.sh                                 # against a running instance
 ```
 
-The e2e and discovery scripts load fluxion themselves. The jobtap and system instance scripts expect fluxion to be the scheduler already, as it is in the CI image. `tests/integration/setup-mock-registry.sh` adds `qdevice_*` vertices to a live graph so the selector has something to discover.
+The e2e and discovery scripts load fluxion themselves. The jobtap and system instance scripts expect fluxion to be the scheduler already, as it is in the CI image. The qdevice vertices come from the static scheduling graph the wrapper configures; `tests/integration/setup-mock-registry.sh` verifies they are discoverable (it grows nothing - mutating a live graph is what used to corrupt fluxion).
 
 ## IonQ
 

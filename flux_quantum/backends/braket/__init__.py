@@ -30,6 +30,7 @@ import datetime
 import json
 import os
 import time
+import uuid
 
 from ..base import Backend, BackendError, Signals, register, tuning
 
@@ -60,6 +61,48 @@ def position_at_most(pos, threshold):
         return int(pos) <= int(threshold)
     except (TypeError, ValueError):
         return False
+
+
+def _quota_exceeded(exc):
+    """A CreateJob the account's hybrid-jobs quota refused.
+
+    Braket caps ACTIVE hybrid jobs per account (3 by default), and QUEUED and
+    CANCELLING jobs count, so a slot stays taken for a while after a hold is
+    released. The refusal arrives as a botocore ClientError, sometimes wrapped
+    by the SDK, hence the string fallback.
+    """
+    code = (getattr(exc, "response", None) or {}).get("Error", {}).get("Code")
+    return code == "ServiceQuotaExceededException" or (
+        "ServiceQuotaExceededException" in str(exc)
+    )
+
+
+def _wait_out_quota(create, started, budget, interval=20.0, clock=None, sleep=None):
+    """Call create() until the hybrid-jobs quota stops refusing it.
+
+    The quota refuses CreateJob outright instead of queueing, so the refusal
+    is just the back of the line: wait for a slot the way wait_for_priority
+    waits for the device. Bounded, so an account full of someone else's jobs
+    cannot pin the scout (and the idle qpu allocation it holds) forever.
+    Anything that is not the quota raises immediately.
+    """
+    clock = clock or time.time
+    sleep = sleep or time.sleep
+    while True:
+        try:
+            return create()
+        except Exception as exc:
+            if not _quota_exceeded(exc):
+                raise
+            waited = clock() - started
+            if waited + interval > budget:
+                raise
+            print(
+                "braket: the hybrid-job quota is full, waiting for a slot "
+                "({:.0f}s)".format(waited),
+                flush=True,
+            )
+            sleep(interval)
 
 
 def region_for(device_arn, override=None):
@@ -362,31 +405,48 @@ class BraketBackend(Backend):
         from braket.aws import AwsSession
 
         self._made["bucket"] = AwsSession().default_bucket()
-        name = "flux-quantum-hold-{}".format(int(self._hold_started))
+        # unique across scouts starting the same second: the name is also the
+        # S3 prefix the token is published under, and two pairs sharing a
+        # prefix would read each other's tokens
+        name = "flux-quantum-hold-{}-{}".format(
+            int(self._hold_started), uuid.uuid4().hex[:6]
+        )
         self._hold_prefix = "flux-quantum/{}".format(name)
         self._made["prefix"] = self._hold_prefix
         max_seconds = int(options.get("hold_max_seconds") or 900)
-        self._hold_job = AwsQuantumJob.create(
-            device=device_arn,
-            # the one file is the whole job. Uploading the package would put
-            # a module named braket in the container, next to the SDK's
-            source_module=os.path.abspath(hold.__file__),
-            entry_point="hold:main",
-            job_name=name,
-            instance_config=InstanceConfig(
-                instanceType=options.get("hold_instance") or "ml.m5.large",
-                instanceCount=1,
-                volumeSizeInGb=30,
+        # The account quota on ACTIVE hybrid jobs (3 by default; QUEUED and
+        # CANCELLING count, so a slot stays taken for a while after a hold is
+        # released) refuses CreateJob instead of queueing it. C4 attempt 3
+        # lost its fourth pair to exactly that with nothing wrong on the
+        # cluster, so a quota refusal is waited out like the device queue.
+        # FLUX_QUANTUM_BRAKET_QUOTA_WAIT bounds the wait, in seconds.
+        self._hold_job = _wait_out_quota(
+            lambda: AwsQuantumJob.create(
+                device=device_arn,
+                # the one file is the whole job. Uploading the package would
+                # put a module named braket in the container, next to the SDK's
+                source_module=os.path.abspath(hold.__file__),
+                entry_point="hold:main",
+                job_name=name,
+                instance_config=InstanceConfig(
+                    instanceType=options.get("hold_instance") or "ml.m5.large",
+                    instanceCount=1,
+                    volumeSizeInGb=30,
+                ),
+                # create takes no environment, so config goes in here
+                hyperparameters={
+                    "flux_quantum_prefix": self._hold_prefix,
+                    "flux_quantum_max_seconds": str(max_seconds),
+                },
+                # Braket stops the job itself, so a wedged entry point still
+                # stops billing
+                stopping_condition=StoppingCondition(
+                    maxRuntimeInSeconds=max_seconds + 300
+                ),
+                wait_until_complete=False,
             ),
-            # create takes no environment, so config goes in here
-            hyperparameters={
-                "flux_quantum_prefix": self._hold_prefix,
-                "flux_quantum_max_seconds": str(max_seconds),
-            },
-            # Braket stops the job itself, so a wedged entry point still
-            # stops billing
-            stopping_condition=StoppingCondition(maxRuntimeInSeconds=max_seconds + 300),
-            wait_until_complete=False,
+            started=self._hold_started,
+            budget=float(tuning("braket_quota_wait", 3600)),
         )
         self._made["job"] = self._hold_job
         return self._hold_job.arn

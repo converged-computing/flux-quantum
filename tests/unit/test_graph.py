@@ -1,4 +1,4 @@
-"""Unit tests for the live-graph populator (fake flux handle)."""
+"""Unit tests for the read-only graph helpers (fake flux handle)."""
 
 import json
 from flux_quantum import graph as qgraph
@@ -13,18 +13,15 @@ class _FakeRPC:
 
 
 class _FakeHandle:
-    """Records add_subgraph payloads and returns a canned graph for find."""
+    """Returns a canned graph for find. There is no write path any more:
+    the qdevices arrive in the static scheduling graph the broker loads."""
 
     def __init__(self, graph):
         self._graph = graph
-        self.added = []
 
     def rpc(self, topic, payload):
         if topic == "sched-fluxion-resource.find":
             return _FakeRPC({"R": json.dumps({"graph": self._graph})})
-        if topic == "sched-fluxion-resource.add_subgraph":
-            self.added.append(json.loads(payload["subgraph"]))
-            return _FakeRPC({})
         raise AssertionError("unexpected rpc: " + topic)
 
 
@@ -44,18 +41,15 @@ def _base_graph():
     }
 
 
-def _idle_lister(ncores=0):
-    """A resource_list stand-in reporting ncores allocated."""
-
-    class _Alloc:
-        def __init__(self, n):
-            self.ncores = n
-
-    class _List:
-        def __init__(self, n):
-            self.allocated = _Alloc(n)
-
-    return lambda handle: _FakeRPC(_List(ncores))
+def _qdevice(vid, vendor):
+    return {
+        "id": str(vid),
+        "metadata": {
+            "type": "qdevice_" + vendor,
+            "rank": -1,
+            "paths": {"containment": "/c0/qdevice_{}0".format(vendor)},
+        },
+    }
 
 
 def test_get_live_graph_parses_find():
@@ -64,47 +58,38 @@ def test_get_live_graph_parses_find():
     assert g["nodes"][0]["metadata"]["type"] == "cluster"
 
 
-def test_populate_adds_missing_vendor():
-    h = _FakeHandle(_base_graph())
-    added = qgraph.populate(h, ["ibm"], lister=_idle_lister(0))
-    assert added == {"ibm"}
-    # one add_subgraph call carrying a qdevice_ibm vertex
-    types = [n["metadata"]["type"] for n in h.added[0]["graph"]["nodes"]]
-    assert "qdevice_ibm" in types and "qpu" in types
-
-
-def test_populate_refuses_when_the_allocation_is_unreadable():
-    """An unknown allocation count is not evidence the instance is idle."""
-
-    def _broken(handle):
-        raise RuntimeError("no scheduler")
-
-    h = _FakeHandle(_base_graph())
-    try:
-        qgraph.populate(h, ["ibm"], lister=_broken)
-    except RuntimeError as exc:
-        assert "could not be read" in str(exc)
-    else:
-        raise AssertionError("populate grew the graph without checking")
-    assert h.added == []
-
-
-def test_populate_is_idempotent():
+def test_vendors_present_reads_qdevice_types():
     g = _base_graph()
-    g["nodes"].append(
-        {
-            "id": "1",
-            "metadata": {
-                "type": "qdevice_ibm",
-                "rank": -1,
-                "paths": {"containment": "/c0/qdevice_ibm0"},
-            },
-        }
-    )
+    g["nodes"].append(_qdevice(1, "ibm"))
     g["edges"].append(
         {"source": "0", "target": "1", "metadata": {"subsystem": "containment"}}
     )
-    h = _FakeHandle(g)
-    added = qgraph.populate(h, ["ibm"])
-    assert added == set()  # already present
-    assert h.added == []  # no add_subgraph call
+    assert qgraph.vendors_present(g) == {"ibm"}
+    assert qgraph.vendors_present(_base_graph()) == set()
+
+
+def test_orphaned_vendors_detects_an_unreachable_qdevice():
+    """A qdevice vertex with no containment edge from the root: find reports
+    it, the matcher cannot reach it, and every scout for it is refused as
+    unsatisfiable. The probe must name it."""
+    g = _base_graph()
+    g["nodes"].append(_qdevice(9, "braket"))  # deliberately no edge
+    assert qgraph.orphaned_vendors(g) == {"braket"}
+
+
+def test_orphaned_vendors_empty_on_a_sound_graph():
+    g = _base_graph()
+    g["nodes"].append(_qdevice(1, "ibm"))
+    g["edges"].append(
+        {"source": "0", "target": "1", "metadata": {"subsystem": "containment"}}
+    )
+    assert qgraph.orphaned_vendors(g) == set()
+
+
+def test_orphaned_vendors_counts_bare_edges_as_containment():
+    """fluxion's find writer emits bare {source, target} edges with no
+    metadata; those are containment and must not look like orphans."""
+    g = _base_graph()
+    g["nodes"].append(_qdevice(1, "ibm"))
+    g["edges"].append({"source": "0", "target": "1"})
+    assert qgraph.orphaned_vendors(g) == set()

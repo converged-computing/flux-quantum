@@ -168,54 +168,70 @@ def _fake_jobspec(command):
     return js
 
 
-def _live_graph():
-    return {
-        "nodes": [
-            {
-                "id": "0",
-                "metadata": {
-                    "type": "cluster",
-                    "rank": -1,
-                    "paths": {"containment": "/c0"},
-                },
+def _live_graph(vendors=("mock",)):
+    """The static scheduling graph as fluxion serves it back: nodes, cores
+    and the qdevice vertices, all present from boot."""
+    nodes = [
+        {
+            "id": "0",
+            "metadata": {
+                "type": "cluster",
+                "rank": -1,
+                "paths": {"containment": "/c0"},
             },
-            {
-                "id": "1",
-                "metadata": {
-                    "type": "node",
-                    "rank": -1,
-                    "paths": {"containment": "/c0/n0"},
-                },
+        },
+        {
+            "id": "1",
+            "metadata": {
+                "type": "node",
+                "rank": -1,
+                "paths": {"containment": "/c0/n0"},
             },
-            {
-                "id": "2",
-                "metadata": {
-                    "type": "core",
-                    "rank": -1,
-                    "paths": {"containment": "/c0/n0/c0"},
-                },
+        },
+        {
+            "id": "2",
+            "metadata": {
+                "type": "core",
+                "rank": -1,
+                "paths": {"containment": "/c0/n0/c0"},
             },
-        ],
-        "edges": [
-            {"source": "0", "target": "1", "metadata": {"subsystem": "containment"}},
-            {"source": "1", "target": "2", "metadata": {"subsystem": "containment"}},
-        ],
-    }
+        },
+    ]
+    edges = [
+        {"source": "0", "target": "1", "metadata": {"subsystem": "containment"}},
+        {"source": "1", "target": "2", "metadata": {"subsystem": "containment"}},
+    ]
+    nid = 3
+    for vendor in vendors:
+        nodes.append(
+            {
+                "id": str(nid),
+                "metadata": {
+                    "type": "qdevice_" + vendor,
+                    "rank": -1,
+                    "paths": {"containment": "/c0/qdevice_{}0".format(vendor)},
+                },
+            }
+        )
+        edges.append(
+            {
+                "source": "0",
+                "target": str(nid),
+                "metadata": {"subsystem": "containment"},
+            }
+        )
+        nid += 1
+    return {"nodes": nodes, "edges": edges}
 
 
-def _run_prepare(
-    stub_flux_cli, submit=None, populate=None, get_graph=None, cancel=None
-):
+def _run_prepare(stub_flux_cli, submit=None, get_graph=None, cancel=None):
     from flux_quantum import cli
 
-    calls = {"submitted": [], "populated": [], "cancelled": []}
+    calls = {"submitted": [], "cancelled": []}
 
     def default_submit(handle, jobspec_json):
         calls["submitted"].append(json.loads(jobspec_json))
         return 12345
-
-    def default_populate(handle, vendors):
-        calls["populated"].append(list(vendors))
 
     def default_cancel(handle, jobid, reason):
         calls["cancelled"].append((jobid, reason))
@@ -226,7 +242,6 @@ def _run_prepare(
         jobspec=js,
         vendor="mock",
         submit_fn=submit or default_submit,
-        populate_fn=populate or default_populate,
         get_graph_fn=get_graph or (lambda h: _live_graph()),
         cancel_fn=cancel or default_cancel,
     )
@@ -244,7 +259,6 @@ def test_prepare_pair_submits_held_wrapped_classical(stub_flux_cli):
     cmd = classical["tasks"][0]["command"]
     assert cmd[:3] == ["flux", "python"] or "wrap.py" in cmd[2]
     assert "myprog" in cmd  # user command preserved
-    assert calls["populated"] == [["mock"]]
 
 
 def test_prepare_pair_rewrites_jobspec_into_scout(stub_flux_cli):
@@ -265,13 +279,10 @@ def test_prepare_pair_gate_aborts_on_unsatisfiable(stub_flux_cli):
         _run_prepare(stub_flux_cli, submit=rejecting_submit)
 
 
-def test_populate_failure_leaves_no_held_classical_behind(stub_flux_cli):
-    """The graph is set up before either half is created, so a graph failure
-    has nothing to clean up."""
+def test_missing_vendor_is_refused_before_anything_is_created(stub_flux_cli):
+    """The graph is static. A vendor that is not in it is refused up front,
+    with no held job created and nothing to clean up."""
     seen = {}
-
-    def boom_populate(handle, vendors):
-        raise RuntimeError("add_subgraph failed")
 
     def rec_cancel(handle, jobid, reason):
         seen["cancelled"] = jobid
@@ -280,18 +291,32 @@ def test_populate_failure_leaves_no_held_classical_behind(stub_flux_cli):
         seen["submitted"] = True
         return 12345
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as exc:
         _run_prepare(
             stub_flux_cli,
-            populate=boom_populate,
+            get_graph=lambda h: _live_graph(vendors=()),  # no qdevices at all
             cancel=rec_cancel,
             submit=rec_submit,
         )
+    assert "scheduling graph" in str(exc.value)
 
-    assert (
-        "submitted" not in seen
-    ), "the classical was created before the graph was ready"
+    assert "submitted" not in seen, "the classical was created despite the refusal"
     assert "cancelled" not in seen, "nothing should need cancelling"
+
+
+def test_unreadable_graph_is_refused_before_anything_is_created(stub_flux_cli):
+    def boom_graph(handle):
+        raise RuntimeError("find RPC failed")
+
+    seen = {}
+
+    def rec_submit(handle, jobspec_json):
+        seen["submitted"] = True
+        return 12345
+
+    with pytest.raises(SystemExit):
+        _run_prepare(stub_flux_cli, get_graph=boom_graph, submit=rec_submit)
+    assert "submitted" not in seen
 
 
 def test_scout_duration_covers_the_classical(stub_flux_cli):
@@ -306,7 +331,6 @@ def test_scout_duration_covers_the_classical(stub_flux_cli):
         jobspec=js,
         vendor="mock",
         submit_fn=lambda h, j: 999,
-        populate_fn=lambda h, v: None,
         get_graph_fn=lambda h: _live_graph(),
         cancel_fn=lambda *a: None,
     )
@@ -327,7 +351,6 @@ def test_scout_duration_covers_the_wait_too(stub_flux_cli):
         jobspec=js,
         vendor="mock",
         submit_fn=lambda h, j: 999,
-        populate_fn=lambda h, v: None,
         get_graph_fn=lambda h: _live_graph(),
         cancel_fn=lambda *a: None,
         wait=1800,
@@ -347,7 +370,6 @@ def test_unlimited_classical_keeps_scout_unlimited(stub_flux_cli):
         jobspec=js,
         vendor="mock",
         submit_fn=lambda h, j: 999,
-        populate_fn=lambda h, v: None,
         get_graph_fn=lambda h: _live_graph(),
         cancel_fn=lambda *a: None,
     )
@@ -368,7 +390,6 @@ def test_job_env_reaches_the_classical(stub_flux_cli):
         vendor="mock",
         job_env={"QRMI_JOB_QPU_RESOURCES": "ibm_kingston"},
         submit_fn=lambda h, j: submitted.setdefault("js", json.loads(j)) and 0 or 7,
-        populate_fn=lambda h, v: None,
         get_graph_fn=lambda h: _live_graph(),
         cancel_fn=lambda *a: None,
     )
@@ -392,7 +413,6 @@ def test_classical_carries_its_core_count(stub_flux_cli):
         jobspec=js,
         vendor="mock",
         submit_fn=lambda h, j: submitted.setdefault("js", json.loads(j)) and 0 or 7,
-        populate_fn=lambda h, v: None,
         get_graph_fn=lambda h: _live_graph(),
         cancel_fn=lambda *a: None,
     )
@@ -500,7 +520,6 @@ def test_flux_dry_run_submits_nothing(stub_flux_cli, capsys):
         jobspec=js,
         vendor="mock",
         submit_fn=submit,
-        populate_fn=lambda h, v: None,
         get_graph_fn=lambda h: _live_graph(),
         cancel_fn=cancel,
         dry_run=True,

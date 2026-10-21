@@ -9,16 +9,24 @@
 # scout's release fails because the job is no longer pending. A fluxion
 # without the policy falls back to the default, so an older build still runs.
 #
-# sched-fluxion-feasibility is left out on purpose. It keeps a private copy of
-# the graph that the qdevice vertices populate adds never reach, so with it
-# loaded every pair is refused as unsatisfiable.
+# sched-fluxion-feasibility is loaded when present. Its graph bootstraps from
+# the notify stream, which carries the initial graph - and with the static
+# scheduling graph ([resource] scheduling) that graph already contains the
+# qdevice vertices, so feasibility needs no special feeding. (The old populate
+# path had to grow it separately because notify never carries grown
+# subgraphs; that path is gone.)
 ensure_fluxion () {
     # reverse dependency order, feasibility sits between resource and qmanager
     flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
     flux module remove -f sched-fluxion-feasibility 2>/dev/null || true
     flux module remove -f sched-fluxion-resource 2>/dev/null || true
     flux module remove -f sched-simple 2>/dev/null || true
-    flux module load sched-fluxion-resource || return 1
+    flux module load sched-fluxion-resource match-format=rv1 || return 1
+    if flux module load sched-fluxion-feasibility 2>/dev/null; then
+        echo "fluxion feasibility loaded"
+    else
+        echo "fluxion loaded WITHOUT feasibility (module not found); validation off"
+    fi
     if flux module load sched-fluxion-qmanager queue-policy=coschedule 2>/dev/null; then
         echo "fluxion loaded, queue policy coschedule"
     else

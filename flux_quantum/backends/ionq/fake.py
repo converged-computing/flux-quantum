@@ -57,6 +57,32 @@ from urllib.parse import parse_qs
 ORDER = ["submitted", "ready", "started", "completed"]
 
 
+def _simulator():
+    """The qemcmc example's statevector simulator, when this is a repo
+    checkout; the package itself takes no dependency on any workload. The
+    fake stays honest without it, results are just a fair coin."""
+    import importlib.util
+    import sys
+
+    if "qemcmc_app" not in sys.modules:
+        path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "..",
+            "..",
+            "examples",
+            "apps",
+            "qemcmc.py",
+        )
+        if not os.path.exists(path):
+            return None
+        spec = importlib.util.spec_from_file_location("qemcmc_app", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["qemcmc_app"] = module
+        spec.loader.exec_module(module)
+    return sys.modules["qemcmc_app"]
+
+
 def _stamp(t=None):
     return datetime.datetime.fromtimestamp(
         time.time() if t is None else t, datetime.timezone.utc
@@ -162,6 +188,7 @@ class State:
             "session_id": session,
             "noise": body.get("noise"),
             "name": body.get("name"),
+            "input": body.get("input"),
             "submitted_at": _stamp(),
             "started_at": None,
             "completed_at": None,
@@ -198,8 +225,32 @@ class State:
                     job["completed_at"] = _stamp()
                     job["execution_duration_ms"] = int(max(1.0, self.seconds) * 1000)
         return 200, {
-            k: v for k, v in job.items() if k not in ("polls", "since", "queue")
+            k: v
+            for k, v in job.items()
+            if k not in ("polls", "since", "queue", "input")
         }
+
+    def job_results(self, jid):
+        """GET /jobs/{id}/results. With a simulator at hand the submitted
+        circuit is simulated exactly, so a hybrid loop against the fake does
+        real physics. The histogram is keyed like the service's, by the
+        decimal value of the measured state, qubit 0 the least significant
+        bit. Without a simulator, or a circuit it reads, a fair coin."""
+        job = self.jobs.get(jid)
+        if job is None:
+            return 404, {"error": "job not found"}
+        program = job.get("input")
+        app = _simulator()
+        if program and app is not None:
+            try:
+                n, ops = app.from_ionq(program)
+                probs = app.probabilities(app.simulate(n, ops), n)
+                return 200, {
+                    str(app.state_to_int(s)): round(p, 10) for s, p in probs.items()
+                }
+            except Exception:
+                pass
+        return 200, {"0": 0.5, "1": 0.5}
 
     def job_cost(self, jid):
         """GET /jobs/{id}/cost, shaped like the service's: the estimate and,
@@ -403,7 +454,7 @@ def make_handler(state):
             if parts[:1] == ["jobs"] and len(parts) == 2 and method == "GET":
                 return state.get_job(parts[1])
             if parts[:1] == ["jobs"] and parts[2:] == ["results"] and method == "GET":
-                return 200, {"0": 0.5, "1": 0.5}
+                return state.job_results(parts[1])
             if parts[:1] == ["jobs"] and parts[2:] == ["status", "cancel"]:
                 return state.cancel_job(parts[1])
             if parts == ["sessions"] and method == "POST":

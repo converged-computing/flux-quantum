@@ -39,7 +39,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.8", "3.10", "3.12"]
+        python-version: ["3.10", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -111,38 +111,43 @@ jobs:
           SH
           flux start bash /tmp/jt.sh
 
+      # the static scheduling graph end to end: the generated JGF is accepted,
+      # jobs allocate and free, a pair runs, feasibility bootstraps from notify
+      - name: static scheduling graph end-to-end
+        run: FLUX_QUANTUM_MOCK=1 bash tests/integration/run-with-static-graph.sh 2 "mock" 2 bash tests/integration/test-static-graph.sh
+
       # the core budget over unfinished pairs, rejecting a pair whose classical
       # half could not be placed rather than admitting it
       - name: jobtap admission control
-        run: FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-admission.sh
+        run: FLUX_QUANTUM_MOCK=1 bash tests/integration/run-with-static-graph.sh 1 "mock ibm braket ionq" 2 bash tests/integration/test-admission.sh
 
       # preemption is destructive, so it runs on its own. Skips itself when the
       # runner has fewer than three cores.
       - name: jobtap preemption
-        run: FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-preemption.sh
+        run: FLUX_QUANTUM_MOCK=1 bash tests/integration/run-with-static-graph.sh 1 "mock ibm braket ionq" 2 bash tests/integration/test-preemption.sh
 
       # unload with a grace timer pending, and reload with jobs running
       - name: jobtap unload and reload
-        run: FLUX_QUANTUM_MOCK=1 flux start bash tests/integration/test-reload.sh
+        run: FLUX_QUANTUM_MOCK=1 bash tests/integration/run-with-static-graph.sh 1 "mock ibm braket ionq" 2 bash tests/integration/test-reload.sh
 
       # one submit gives a held classical and a scout, and the qpu stays
       # allocated until the classical is done
       - name: end-to-end, single broker
-        run: flux start bash tests/integration/test-mock-e2e.sh
+        run: bash tests/integration/run-with-static-graph.sh 1 "mock ibm braket ionq" 2 bash tests/integration/test-mock-e2e.sh
 
       # two ranks, so the pair can be placed on different ranks
       - name: end-to-end, two broker ranks
-        run: flux start -s2 bash tests/integration/test-mock-e2e.sh
+        run: bash tests/integration/run-with-static-graph.sh 2 "mock ibm braket ionq" 2 bash tests/integration/test-mock-e2e.sh
 
       # vendors discovered from the graph rather than named
       - name: vendor discovery + --quantum-select
-        run: flux start bash tests/integration/test-select-discovery.sh
+        run: bash tests/integration/run-with-static-graph.sh 1 "mock ibm braket" 2 bash tests/integration/test-select-discovery.sh
 
       - name: IonQ backend end-to-end, against the fake service
-        run: flux start bash tests/integration/test-ionq-e2e.sh
+        run: bash tests/integration/run-with-static-graph.sh 1 "mock ibm braket ionq" 2 bash tests/integration/test-ionq-e2e.sh
 
       - name: IonQ backend end-to-end, account without sessions
-        run: FAKE_IONQ_NO_SESSIONS=1 flux start bash tests/integration/test-ionq-e2e.sh
+        run: FAKE_IONQ_NO_SESSIONS=1 bash tests/integration/run-with-static-graph.sh 1 "mock ibm braket ionq" 2 bash tests/integration/test-ionq-e2e.sh
 
       # this test expects fluxion already loaded, as rc1 does on a real cluster
       - name: system-instance test (fluxion preloaded, 2 ranks)
@@ -151,9 +156,11 @@ jobs:
           set -e
           flux module remove -f sched-simple 2>/dev/null || true
           flux module load sched-fluxion-resource match-format=rv1
+          flux module load sched-fluxion-feasibility 2>/dev/null \
+            || echo "no feasibility module; step 9 will SKIP"
           flux module load sched-fluxion-qmanager queue-policy=coschedule \
             || flux module load sched-fluxion-qmanager
           export FLUX_CLI_PLUGINPATH=$PWD/cli-plugins
           bash tests/integration/test-system-instance.sh
           SH
-          flux start -s2 bash /tmp/sys.sh
+          bash tests/integration/run-with-static-graph.sh 2 "mock ibm braket ionq" 2 bash /tmp/sys.sh

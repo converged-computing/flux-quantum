@@ -57,7 +57,7 @@ def select_vendor(candidates=None, policy=None):
             log.append("{}: probe failed: {}".format(name, e))
             continue
         if not sig.available:
-            log.append("{}: not available".format(name))
+            log.append("{}: not available ({})".format(name, sig.detail))
             continue
         usable.append((name, sig))
         log.append("{}: candidate ({})".format(name, sig))

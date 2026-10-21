@@ -118,6 +118,36 @@ def test_mock_open_session_uses_options(monkeypatch):
     assert b.open_session({}).startswith("mock-session-")
 
 
+def test_session_mode_is_batch_unless_asked(fresh, monkeypatch):
+    """A dedicated session bills wall clock, idle gaps included, and it is
+    QRMI's own default. The backend sets batch unless the operator or the
+    environment says dedicated."""
+    import os
+
+    from flux_quantum.backends import qrmi as q
+
+    name = "ibm_kingston_QRMI_IBM_QRS_SESSION_MODE"
+    monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("FLUX_QUANTUM_IBM_SESSION_MODE", raising=False)
+    assert q.session_mode("ibm_kingston", "qiskit-runtime-service") == "batch"
+    assert os.environ[name] == "batch"
+
+    monkeypatch.setenv("FLUX_QUANTUM_IBM_SESSION_MODE", "dedicated")
+    monkeypatch.delenv(name)
+    assert q.session_mode("ibm_kingston", "qiskit-runtime-service") == "dedicated"
+
+    # a value already on the resource wins over the operator setting
+    monkeypatch.setenv(name, "batch")
+    assert q.session_mode("ibm_kingston", "qiskit-runtime-service") == "batch"
+
+    monkeypatch.setenv(name, "nonsense")
+    with pytest.raises(ValueError, match="batch or dedicated"):
+        q.session_mode("ibm_kingston", "qiskit-runtime-service")
+
+    # direct access has no session modes
+    assert q.session_mode("ibm_kingston", "ibm-quantum-system") is None
+
+
 def test_open_session_without_a_resource_is_explicit(fresh, monkeypatch):
     _fake_qrmi(monkeypatch)
     b = fresh(mock=False, env=IBM_CREDS)
@@ -138,3 +168,99 @@ def test_open_session_names_the_missing_variable(fresh, monkeypatch):
         )
     assert "ibm_torino_QRMI_IBM_QRS_IAM_APIKEY" in str(e.value)
     assert "supersecret" not in str(e.value)
+
+
+# --------------------------------------------------- braket hybrid-job quota
+# The account quota on ACTIVE hybrid jobs refuses CreateJob outright instead
+# of queueing (C4 attempt 3 lost its fourth pair to it). The scout waits a
+# quota refusal out, bounded, and raises everything else untouched.
+
+
+class _QuotaError(Exception):
+    """Shaped like the botocore ClientError AWS actually raises."""
+
+    def __init__(self):
+        super().__init__(
+            "An error occurred (ServiceQuotaExceededException) when calling "
+            "the CreateJob operation: You have 3 active hybrid jobs."
+        )
+        self.response = {"Error": {"Code": "ServiceQuotaExceededException"}}
+
+
+def _quota_clock(start=100.0):
+    state = {"now": start, "naps": []}
+
+    def clock():
+        return state["now"]
+
+    def sleep(seconds):
+        state["naps"].append(seconds)
+        state["now"] += seconds
+
+    return state, clock, sleep
+
+
+def test_quota_refusals_are_waited_out():
+    from flux_quantum.backends import braket
+
+    calls = {"n": 0}
+
+    def create():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _QuotaError()
+        return "the-job"
+
+    state, clock, sleep = _quota_clock()
+    got = braket._wait_out_quota(
+        create, started=100.0, budget=600, clock=clock, sleep=sleep
+    )
+    assert got == "the-job"
+    assert calls["n"] == 3
+    assert len(state["naps"]) == 2
+
+
+def test_quota_wait_gives_up_at_its_budget():
+    from flux_quantum.backends import braket
+
+    state, clock, sleep = _quota_clock()
+
+    def create():
+        raise _QuotaError()
+
+    with pytest.raises(Exception, match="ServiceQuotaExceededException"):
+        braket._wait_out_quota(
+            create, started=100.0, budget=60, interval=20.0, clock=clock, sleep=sleep
+        )
+    # it slept toward the budget but never past it
+    assert state["now"] - 100.0 <= 60
+
+
+def test_non_quota_errors_raise_immediately():
+    from flux_quantum.backends import braket
+
+    calls = {"n": 0}
+
+    def create():
+        calls["n"] += 1
+        raise RuntimeError("ValidationException: bad instance type")
+
+    state, clock, sleep = _quota_clock()
+    with pytest.raises(RuntimeError, match="ValidationException"):
+        braket._wait_out_quota(
+            create, started=100.0, budget=600, clock=clock, sleep=sleep
+        )
+    assert calls["n"] == 1
+    assert state["naps"] == []
+
+
+def test_wrapped_quota_error_is_detected_by_its_message():
+    """The SDK sometimes rewraps the ClientError; the string still names it."""
+    from flux_quantum.backends import braket
+
+    wrapped = RuntimeError(
+        "create failed: An error occurred (ServiceQuotaExceededException) "
+        "when calling the CreateJob operation"
+    )
+    assert braket._quota_exceeded(wrapped)
+    assert not braket._quota_exceeded(RuntimeError("AccessDeniedException"))

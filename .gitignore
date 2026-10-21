@@ -13,3 +13,13 @@ __pycache__/
 
 # a sibling checkout the experiments live in
 flux-quantum-experiments/
+
+# sibling checkouts that live inside this workspace, each its own repo
+flux-sched/
+flux-tutorials/
+fluence/
+Tutorials/
+
+# scratch logs
+experiments/forte/campaign.log
+flux-quantum-experiments/

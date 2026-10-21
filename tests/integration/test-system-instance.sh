@@ -107,5 +107,53 @@ if [ -n "$errs" ]; then
 fi
 
 echo ""
+echo "=== 9. feasibility knows the vendor devices ==="
+# The feasibility module bootstraps its own graph from the notify stream,
+# which carries the initial graph - the static scheduling graph, qdevices
+# included. Prove it both ways: a scout for a configured vendor is feasible,
+# one for an unknown vendor is refused.
+if ! flux module list | grep -q sched-fluxion-feasibility; then
+    echo "    SKIP: sched-fluxion-feasibility is NOT loaded, so the"
+    echo "    SKIP: feasibility check is NOT being tested. Load it (it"
+    echo "    SKIP: bootstraps itself from notify) and rerun this test."
+else
+    flux python - <<'PYEOF' || rc=1
+import errno
+import sys
+
+import flux
+from flux_quantum.launch import build_scout_jobspec
+
+handle = flux.Flux()
+
+
+def check(vendor):
+    """errno from feasibility.check, None when the scout is feasible."""
+    try:
+        handle.rpc(
+            "feasibility.check", {"jobspec": build_scout_jobspec(vendor, 1)}
+        ).get()
+        return None
+    except OSError as exc:
+        return exc.errno
+
+
+got = check("mock")
+if got is not None:
+    print("    FAIL: a mock scout is called unsatisfiable (errno {}). The".format(got))
+    print("    feasibility graph is missing the configured vendor devices")
+    sys.exit(1)
+print("    a mock scout is feasible")
+
+got = check("nosuchvendor")
+if got in (errno.ENODEV, errno.EINVAL):
+    print("    an unknown vendor is refused (errno {})".format(got))
+    sys.exit(0)
+print("    FAIL: an unknown vendor was not refused (got errno {})".format(got))
+sys.exit(1)
+PYEOF
+fi
+
+echo ""
 echo "=== system-instance test rc=$rc ==="
 exit "$rc"

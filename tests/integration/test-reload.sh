@@ -32,8 +32,14 @@ fi
 ensure_fluxion || { echo "FAIL could not load fluxion"; exit 1; }
 
 make -s -C "$HERE/flux_quantum/jobtap" || { echo "FAIL build"; exit 1; }
-flux python -m flux_quantum.populate mock >/dev/null 2>&1 \
-    || echo "WARNING could not populate the graph up front"
+# The vendor must already be in the graph: the instance is started with the
+# static scheduling graph (run-with-static-graph.sh). Growing a live graph is
+# the thing that corrupted fluxion, and that path no longer exists.
+flux python -c "
+import flux
+from flux_quantum import graph
+assert 'mock' in graph.vendors_present(graph.get_live_graph(flux.Flux()))
+" 2>/dev/null || echo "WARNING qdevice_mock not in the graph; start me via run-with-static-graph.sh"
 
 query () {
     flux jobtap query quantum.so

@@ -6,15 +6,15 @@ build-backend = "setuptools.build_meta"
 name = "flux-quantum"
 version = "0.0.11"
 description = "Quantum + classical coscheduling components for Flux (CLI plugin, jobtap, backends, scout)"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 # NOTE: interfaces (esp. flux.cli.plugin.CLIPlugin) are not yet stable across
 # flux-core releases. Developed/tested against flux-core 0.87.0. Pin to a
 # contemporaneous flux-core, per Flux packaging guidance.
 
 [project.scripts]
-# populate the graph once at startup. Growing it while jobs hold resources
-# corrupts fluxion, so this must run before any job does.
-flux-quantum-populate = "flux_quantum.populate:main"
+# generate the static scheduling graph the broker is configured with
+# ([resource] scheduling). The graph is never mutated at runtime.
+flux-quantum-schedjgf = "flux_quantum.schedjgf:main"
 
 [project.optional-dependencies]
 # qrmi needs python 3.11 or newer, so it stays optional

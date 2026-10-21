@@ -104,7 +104,6 @@ def prepare_pair(
     options=None,
     job_env=None,
     submit_fn=None,
-    populate_fn=None,
     get_graph_fn=None,
     cancel_fn=None,
     wrap_path=None,
@@ -126,7 +125,6 @@ def prepare_pair(
     """
     submit_fn = submit_fn or submit
     cancel_fn = cancel_fn or cancel
-    populate_fn = populate_fn or graph.populate
     get_graph_fn = get_graph_fn or graph.get_live_graph
     if wrap_path is None:
         wrap_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wrap.py")
@@ -155,17 +153,25 @@ def prepare_pair(
     if job_env:
         sysattr.setdefault("environment", {}).update(job_env)
 
-    # Populate and ask fluxion before creating anything, so a pair the graph
-    # can never hold is refused with no held job to clean up. The scout shape
-    # comes from the live graph so the node to core path matches reality.
+    # Read the graph and ask fluxion before creating anything, so a pair the
+    # graph can never hold is refused with no held job to clean up. The scout
+    # shape comes from the live graph so the node to core path matches
+    # reality. The graph is read-only here: the qdevices are part of the
+    # static scheduling graph the broker was configured with, and a vendor
+    # that is not in it is refused, never added.
     try:
-        populate_fn(handle, [vendor])
         live = get_graph_fn(handle)
     except SystemExit:
         raise
     except Exception as exc:
         raise SystemExit(
-            "flux quantum: could not prepare the quantum graph: {}".format(exc)
+            "flux quantum: could not read the scheduler graph: {}".format(exc)
+        )
+    if vendor not in graph.vendors_present(live):
+        raise SystemExit(
+            "flux quantum: no {} device in the scheduling graph. The graph is "
+            "static: add the vendor to the generated scheduling.json "
+            "(flux python -m flux_quantum.schedjgf) and restart flux.".format(vendor)
         )
 
     # only the resources matter to the question, so the job id is a placeholder
