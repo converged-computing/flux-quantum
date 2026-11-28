@@ -245,6 +245,13 @@ def prepare_pair(
     out = jobspec.jobspec.setdefault("attributes", {}).setdefault("system", {})
     out.pop("hold", None)  # the scout runs immediately
     out["duration"] = scout["attributes"]["system"]["duration"]
+    # the partner id rides along so the jobtap plugin can cancel the held
+    # classical if this scout dies without releasing it
+    quantum = scout["attributes"]["system"].get("quantum")
+    if quantum:
+        out["quantum"] = quantum
+    else:
+        out.pop("quantum", None)
     return main_id
 
 

@@ -62,6 +62,14 @@ def build_scout_jobspec(
                 }
             ],
         }
+    # the jobtap plugin cancels the held classical if its scout dies without
+    # releasing it, and this attribute is how it knows whose scout this is.
+    # No vendor key here, or the plugin would take the scout for a classical.
+    attributes = {"system": {"duration": duration}}
+    try:
+        attributes["system"]["quantum"] = {"partner": int(hold_job)}
+    except (TypeError, ValueError):
+        pass  # a placeholder id (dry run), nothing to guard
     return {
         "version": 1,
         "resources": [
@@ -70,7 +78,7 @@ def build_scout_jobspec(
             # R. One shape source, shared with the graph populator.
             qresource.jobspec_resource(vendor),
         ],
-        "attributes": {"system": {"duration": duration}},
+        "attributes": attributes,
         "tasks": [{"command": command, "slot": "scout", "count": {"per_slot": 1}}],
     }
 

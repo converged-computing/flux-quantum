@@ -83,8 +83,13 @@ class MockBackend(Backend):
         wait = self.queue_wait(options)
         started = now()
         per = wait / depth if depth else 0.0
+        # at most ~50 reports however deep the queue: a real vendor reports
+        # every few seconds, and thousands of flushed lines through the job
+        # shell is thousands of KVS appends for nothing
+        step = max(1, depth // 50)
         for ahead in range(depth, 0, -1):
-            print("mock: queued at position {}".format(ahead), flush=True)
+            if ahead == depth or ahead == 1 or ahead % step == 0:
+                print("mock: queued at position {}".format(ahead), flush=True)
             sleep(per)
         remaining = wait - (now() - started)
         if remaining > 0:

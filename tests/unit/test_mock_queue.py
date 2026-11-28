@@ -112,3 +112,17 @@ def test_the_knobs_are_environment_variables(mock, monkeypatch):
     opts = mock.scout_options({"hold": "probe"})
     assert opts["queue_depth"] == 25 and opts["service_time"] == 0.5
     assert opts["session"] == "forced"
+
+
+def test_deep_queues_throttle_the_position_reports(mock, capsys):
+    """Thousands of flushed lines through the job shell are thousands of KVS
+    appends for nothing; however deep the queue, about fifty reports do."""
+    mock.wait_for_priority(
+        {"queue_depth": 500, "service_time": 0.0, "base_overhead": 0.0},
+        sleep=lambda s: None,
+        now=lambda: 0.0,
+    )
+    out = capsys.readouterr().out
+    lines = [l for l in out.splitlines() if "queued at position" in l]
+    assert len(lines) <= 60
+    assert "position 500" in out and "position 1" in out

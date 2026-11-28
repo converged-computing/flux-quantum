@@ -160,18 +160,19 @@ static void track (flux_jobid_t id,
                    int cores,
                    int protected_,
                    int pair,
-                   double run)
+                   double run,
+                   json_int_t partner)
 {
     char key[32];
     json_t *entry;
 
     if (!g_jobs)
         return;
-    entry = json_pack ("{s:i s:b s:b s:f s:b s:b s:f s:s}",
+    entry = json_pack ("{s:i s:b s:b s:f s:b s:b s:f s:s s:I}",
                        "cores", cores, "protected", protected_,
                        "pair", pair, "run", run,
                        "released", 0, "preempted", 0, "t_estimate", 0.0,
-                       "selection", "");
+                       "selection", "", "partner", partner);
     if (entry)
         (void) json_object_set_new (g_jobs, idkey (id, key, sizeof (key)), entry);
 }
@@ -340,6 +341,16 @@ static const char *job_vendor (json_t *jobspec)
     (void) json_unpack (jobspec, "{s:{s:{s:{s:s}}}}",
                         "attributes", "system", "quantum", "vendor", &vendor);
     return vendor;
+}
+
+/* The scout carries its classical's id, so a scout that dies without
+ * releasing can be followed to the job it would leave parked. */
+static json_int_t job_partner (json_t *jobspec)
+{
+    json_int_t partner = 0;
+    (void) json_unpack (jobspec, "{s:{s:{s:{s:I}}}}",
+                        "attributes", "system", "quantum", "partner", &partner);
+    return partner;
 }
 
 static int validate_cb (flux_plugin_t *p,
@@ -684,13 +695,60 @@ static int new_cb (flux_plugin_t *p,
     cores = count_R_cores (R);
     if (cores <= 0)
         cores = count_tree_cores_top (jobspec);
-    track (id, cores, needs_protection (jobspec, vendor), vendor ? 1 : 0, run);
+    track (id, cores, needs_protection (jobspec, vendor), vendor ? 1 : 0, run,
+           job_partner (jobspec));
 
     /* The classical half's release and reservation arrive as events. A
      * release that happened before a reload is not replayed, so that pair is
-     * left to the scheduler. */
-    if (g_preempt && vendor && run <= 0.0)
+     * left to the scheduler. The released flag feeds the scout-death backstop
+     * as well as preemption, so the subscription is unconditional. */
+    if (vendor && run <= 0.0)
         (void) flux_jobtap_job_subscribe (p, id);
+    return 0;
+}
+
+/* A scout that dies without releasing leaves its classical held forever:
+ * the classical has no walltime of its own, and the scout's own cleanup
+ * cannot be trusted at the moment it is being killed. Production saw
+ * exactly that: the job shell died FATAL mid-wait (input.kvs got ENOSYS)
+ * and the scout never ran a handler, so its classical sat parked. The
+ * plugin outlives both halves, so the backstop lives here.
+ *
+ * A release that happened before a plugin reload is not replayed, so for
+ * a short window after a reload a released-but-pending classical could be
+ * cancelled wrongly, but only if its scout also crashes inside that window;
+ * a scout that lives waits out the classical and arrives here after it. */
+static int inactive_cb (flux_plugin_t *p,
+                        const char *topic,
+                        flux_plugin_arg_t *args,
+                        void *arg)
+{
+    flux_t *h = flux_jobtap_get_flux (p);
+    flux_jobid_t id;
+    json_t *entry;
+    json_t *pentry;
+    json_int_t partner = 0;
+
+    if (flux_plugin_arg_unpack (args, FLUX_PLUGIN_ARG_IN, "{s:I}", "id", &id) < 0)
+        return 0;
+    if (!(entry = lookup (id)))
+        return 0;
+    (void) json_unpack (entry, "{s?I}", "partner", &partner);
+    if (partner <= 0)
+        return 0;
+    if (!(pentry = lookup ((flux_jobid_t) partner)))
+        return 0;       /* finished or forgotten, nothing is parked */
+    if (entry_flag (pentry, "released") || entry_real (pentry, "run") > 0.0)
+        return 0;       /* handed over, the classical lives its own life */
+    flux_log (h, LOG_ERR,
+              "quantum: scout %ju died without releasing job %ju, cancelling "
+              "it rather than leaving it held forever",
+              (uintmax_t) id, (uintmax_t) partner);
+    if (flux_jobtap_raise_exception (p, (flux_jobid_t) partner, "quantum", 0,
+                                     "scout %ju died before releasing this job",
+                                     (uintmax_t) id) < 0)
+        flux_log_error (h, "quantum: could not cancel orphaned job %ju",
+                        (uintmax_t) partner);
     return 0;
 }
 
@@ -818,6 +876,7 @@ static const struct flux_plugin_handler handlers[] = {
     { "job.state.priority",    priority_cb, NULL },
     { "job.priority.get",      priority_cb, NULL },
     { "job.state.run",         run_cb,      NULL },
+    { "job.state.inactive",    inactive_cb, NULL },
     { "job.event.memo",        event_cb,    NULL },
     { "job.event.annotations", event_cb,    NULL },
     { "job.destroy",           destroy_cb,  NULL },
