@@ -1,0 +1,133 @@
+#!/bin/bash
+# One coscheduled pair, end to end, with the output that shows the handoff.
+#
+#   flux-quantum-demo mock          token free rehearsal, the mock vendor
+#   flux-quantum-demo ibm           the real thing, IBM through QRMI. Costs.
+#   flux-quantum-demo ibm -y        skip the confirmation
+#
+# The ibm run needs QRMI credentials for one resource in the environment,
+# either the four <resource>_QRMI_IBM_QRS_* variables (see ../env.example),
+# or IBM_CLOUD_TOKEN plus IBM_CLOUD_CRN plus RESOURCE, from which the four are
+# derived here the same way ibm-run derives them.
+#
+#   RESOURCE   the QRMI resource id, an IBM backend name like ibm_kingston.
+#              Optional when exactly one resource is configured
+#   SHOTS      shots for the Bell circuit the classical job submits, 100
+#   WALLTIME   the classical job's -t, 5m. The session lives this long at most
+#   WAIT       --quantum-wait, how long the scout waits for the warm-up task
+#              to reach the head of the queue, 1800. Waiting is free
+#   NTASKS     cores for the classical job, 1
+#   OUT        where the transcript goes, ~/flux-quantum-demo-<time>
+set -u
+HERE=/opt/flux-quantum/examples/qrmi/container
+WORKLOAD=${WORKLOAD:-$HERE/workload.py}
+SHOTS=${SHOTS:-100}
+WALLTIME=${WALLTIME:-5m}
+WAIT=${WAIT:-1800}
+NTASKS=${NTASKS:-1}
+OUT=${OUT:-$HOME/flux-quantum-demo-$(date +%Y%m%d-%H%M%S)}
+
+say() { echo; echo "== $* =="; }
+die() { echo "flux-quantum-demo: $*" >&2; exit 1; }
+
+mode=${1:-}
+shift || true
+yes=0
+[ "${1:-}" = "-y" ] && yes=1
+
+flux resource list >/dev/null 2>&1 || die "no instance. Run inside flux-quantum-start"
+mkdir -p "$OUT"
+
+submit_and_watch() {
+    # $1 vendor, rest are extra submit args. Prints everything and saves it.
+    local vendor=$1; shift
+    local err scout main t0 t1
+    err=$(mktemp)
+    t0=$(date +%s)
+    say "submit"
+    echo "flux submit -t $WALLTIME --quantum-vendor $vendor $* -n$NTASKS -- flux python $WORKLOAD --shots $SHOTS"
+    # stdout is the scout id, the held classical job id comes back on stderr
+    scout=$(flux submit -t "$WALLTIME" --quantum-vendor "$vendor" "$@" -n"$NTASKS" \
+                -- flux python "$WORKLOAD" --shots "$SHOTS" 2>"$err")
+    sed 's/^/  /' "$err" | tee "$OUT/submit.txt"
+    main=$(grep -oE 'held classical job [0-9]+' "$err" | awk '{print $NF}')
+    rm -f "$err"
+    [ -n "$main" ] || die "no held classical job, see above"
+    echo "  scout=$scout classical=$main" | tee -a "$OUT/submit.txt"
+
+    say "both halves, the classical is held until the scout releases it"
+    flux jobs -a -o "{id.f58:>12} {name:<12} {state:<8} {ntasks:>3} {t_run!d:%H:%M:%S::>8}" | sed 's/^/  /'
+
+    say "waiting. queue time at the vendor is not billed"
+    flux job wait-event -t "$((WAIT + 900))" "$main" clean >/dev/null 2>&1 \
+        || echo "  the classical did not finish in time"
+    flux job wait-event -t 300 "$scout" clean >/dev/null 2>&1 || true
+    t1=$(date +%s)
+
+    {
+        say "scout ($scout): opened the session, confirmed priority, released, held the qpu, closed"
+        flux job attach "$scout" 2>&1 | sed 's/^/  /'
+        say "classical ($main): the workload, with the session in its environment"
+        flux job attach "$main" 2>&1 | sed 's/^/  /'
+        say "the handoff on the classical eventlog"
+        flux job eventlog "$main" 2>&1 | grep -E "memo|release|alloc|start|finish" | sed 's/^/  /'
+        say "resources each half was given"
+        for id in "$scout" "$main"; do
+            printf '  %s  ' "$id"
+            flux job info "$id" R 2>/dev/null | jq -c '.execution.R_lite' 2>/dev/null || echo "?"
+        done
+        echo
+        echo "submit to both done: $((t1 - t0))s"
+    } | tee "$OUT/run.txt"
+    echo
+    echo "saved to $OUT/run.txt"
+}
+
+case "$mode" in
+    mock)
+        [ -n "${FLUX_QUANTUM_MOCK:-}" ] || die "FLUX_QUANTUM_MOCK must be set before flux start for the mock vendor"
+        export FLUX_QUANTUM_MOCK_SESSION="${FLUX_QUANTUM_MOCK_SESSION:-demo-$$}"
+        echo "mock vendor, no token, nothing billed. The mock simulates a vendor queue,"
+        echo "FLUX_QUANTUM_MOCK_QUEUE=30 makes the scout wait for it."
+        submit_and_watch mock
+        ;;
+    ibm)
+        # derive the four QRMI variables from the cloud token and the CRN when
+        # the resource is named, like ibm-run does
+        if [ -n "${RESOURCE:-}" ] && [ -n "${IBM_CLOUD_TOKEN:-}" ] && [ -n "${IBM_CLOUD_CRN:-}" ]; then
+            export "${RESOURCE}_QRMI_IBM_QRS_ENDPOINT=https://quantum.cloud.ibm.com/api/v1"
+            export "${RESOURCE}_QRMI_IBM_QRS_IAM_ENDPOINT=https://iam.cloud.ibm.com"
+            export "${RESOURCE}_QRMI_IBM_QRS_IAM_APIKEY=$IBM_CLOUD_TOKEN"
+            export "${RESOURCE}_QRMI_IBM_QRS_SERVICE_CRN=$IBM_CLOUD_CRN"
+        fi
+        say "credentials, names only"
+        note=$(flux python -c "
+from flux_quantum.backends import get_backend
+print(get_backend('ibm').credential_note)" 2>&1) || die "$(echo "$note" | tail -1)"
+        echo "  $note"
+        if [ -z "${RESOURCE:-}" ]; then
+            RESOURCE=$(flux python -c "
+from flux_quantum.backends.qrmi import resources_in_environment, missing_env
+r = [x for x in resources_in_environment('qiskit-runtime-service') if not missing_env(x, 'qiskit-runtime-service')]
+print(r[0] if len(r) == 1 else '')")
+            [ -n "$RESOURCE" ] || die "more than one resource is configured, set RESOURCE"
+        fi
+        echo "  resource $RESOURCE"
+        echo
+        echo "This opens a session on $RESOURCE, runs a one shot warm-up task to confirm"
+        echo "the session is active, then the classical job submits a Bell circuit with"
+        echo "$SHOTS shots into the session and prints the counts. The session closes when"
+        echo "the classical job exits. IBM bills QPU seconds used and, in dedicated mode,"
+        echo "session time, so it costs a few QPU seconds. Nothing is billed while queued."
+        if [ "$yes" -ne 1 ]; then
+            read -r -p "continue? [y/N] " ans
+            [ "$ans" = y ] || [ "$ans" = Y ] || exit 0
+        fi
+        unset FLUX_QUANTUM_MOCK_SESSION
+        submit_and_watch ibm --quantum-device "$RESOURCE" --quantum-wait "$WAIT"
+        ;;
+    *)
+        sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+        exit 2
+        ;;
+esac

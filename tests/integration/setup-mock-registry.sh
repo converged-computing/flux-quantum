@@ -1,42 +1,35 @@
 #!/bin/bash
-# Populate the live fluxion graph with qdevice marker vertices, so the selector
-# has something to discover with find. These are plain graph vertices, no
-# vendor API and no token.
+# Load fluxion and verify the vendor registry is in the graph, so the selector
+# has something to discover with find. The qdevice vertices are part of the
+# static scheduling graph the instance was configured with - start the
+# instance through run-with-static-graph.sh. Nothing is grown here: the old
+# add_subgraph populate is gone, mutating a live graph is what corrupted
+# fluxion.
 #
-# add-subgraph works with qmanager, unlike load-file. Fluxion is loaded the
-# normal way and the markers are grown into the running graph. A load-file
-# graph cannot handshake with qmanager at all.
-#
-# Run inside the container, in a flux instance with flux-sched add-hold.
 # Vendors default to mock ibm braket.
 set -eu
 VENDORS="${VENDORS:-mock ibm braket}"
-SUB="${SUB:-/tmp/quantum-subgraph.json}"
-LIVE="${LIVE:-/tmp/live-graph.json}"
 
 echo "-- release preloaded scheduler; load fluxion + qmanager NORMALLY --"
-flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
-flux module remove -f sched-fluxion-resource 2>/dev/null || true
-flux module remove -f sched-simple 2>/dev/null || true
-flux module load sched-fluxion-resource
-flux module load sched-fluxion-qmanager
+. "$(dirname "$0")/fluxion.sh"
+ensure_fluxion || { echo "FAIL could not load fluxion"; exit 1; }
 
-echo "-- populate qdevice_<vendor> -> qpu into the live graph (find + add_subgraph RPC) --"
-flux python -c "
+echo "-- verify the configured qdevice markers are discoverable via find --"
+# the same find RPC the plugin uses, so this does not need flux ion-resource
+found=$(flux python -c "
 import flux
 from flux_quantum import graph
-added = graph.populate(flux.Flux(), \"\"\"$VENDORS\"\"\".split())
-print('added vendors:', sorted(added))
-"
-
-echo "-- verify markers are discoverable via find --"
-found=$(flux ion-resource find --format=jgf status=up | sed -n '/^{/,$p' \
-        | grep -oE 'qdevice_[a-z_]+' | sort -u | tr '\n' ' ')
+print(' '.join('qdevice_' + v for v in sorted(graph.vendors_present(graph.get_live_graph(flux.Flux())))))")
 echo "discoverable vendor types: $found"
 for v in $VENDORS; do
     case " $found " in
         *" qdevice_${v} "*) : ;;
-        *) echo "FAIL: qdevice_${v} not found in registry"; exit 1 ;;
+        *)
+            echo "FAIL: qdevice_${v} not in the graph. Start the instance with"
+            echo "      the static scheduling graph, e.g."
+            echo "      bash tests/integration/run-with-static-graph.sh 1 \"$VENDORS\" 2 bash <test>"
+            exit 1
+            ;;
     esac
 done
 echo "PASS: vendor registry present ($found)"

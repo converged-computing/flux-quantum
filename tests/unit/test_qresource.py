@@ -23,62 +23,6 @@ def test_jobspec_resource_nqpus():
     assert r["with"][0]["count"] == 3
 
 
-def _live(root_path="/cluster0"):
-    return {
-        "nodes": [
-            {
-                "id": "0",
-                "metadata": {
-                    "type": "cluster",
-                    "rank": -1,
-                    "paths": {"containment": root_path},
-                },
-            },
-            {
-                "id": "1",
-                "metadata": {
-                    "type": "rack",
-                    "rank": -1,
-                    "paths": {"containment": root_path + "/rack0"},
-                },
-            },
-        ],
-        "edges": [
-            {"source": "0", "target": "1", "metadata": {"subsystem": "containment"}}
-        ],
-    }
-
-
-def test_graph_subgraph_attaches_qdevice_at_root():
-    sg = qr.graph_subgraph(_live(), ["ibm"])
-    g = sg["graph"]
-    types = [n["metadata"]["type"] for n in g["nodes"]]
-    assert "qdevice_ibm" in types and types.count("qpu") == 1
-    # the root is copied verbatim so fluxion matches (path, rank) and attaches
-    assert any(
-        n["id"] == "0" and n["metadata"]["type"] == "cluster" for n in g["nodes"]
-    )
-    # qdevice is a child of the root (id 0) -> a sibling of rack
-    qd = next(n for n in g["nodes"] if n["metadata"]["type"] == "qdevice_ibm")
-    assert any(e["source"] == "0" and e["target"] == qd["id"] for e in g["edges"])
-
-
-def test_graph_subgraph_multi_vendor_unique_ids():
-    sg = qr.graph_subgraph(_live(), ["ibm", "mock"], qpus=2)
-    ids = [n["id"] for n in sg["graph"]["nodes"]]
-    assert len(ids) == len(set(ids))  # no id collisions
-    types = [n["metadata"]["type"] for n in sg["graph"]["nodes"]]
-    assert types.count("qpu") == 4  # 2 vendors x 2 qpus
-
-
-def test_graph_subgraph_and_jobspec_agree_on_type():
-    """Graph and jobspec have to use the same type string."""
-    sg = qr.graph_subgraph(_live(), ["ibm"])
-    jr = qr.jobspec_resource("ibm")
-    graph_types = {n["metadata"]["type"] for n in sg["graph"]["nodes"]}
-    assert jr["type"] in graph_types  # qdevice_ibm present in both
-
-
 def _live_with_sockets():
     # cluster -> node -> socket -> core (hwloc-style)
     return {
@@ -165,3 +109,78 @@ def test_classical_resource_fallback_no_core():
     }
     r = qr.classical_resource(empty)
     assert r["type"] == "node" and r["with"][0]["type"] == "slot"
+
+
+def test_count_cores_walks_the_resource_tree():
+    """The jobtap plugin budgets on this number, so it has to be right for the
+    shapes the plugin will actually see."""
+    from flux_quantum.qresource import count_cores
+
+    node_slot_core = {
+        "resources": [
+            {
+                "type": "node",
+                "count": 1,
+                "with": [
+                    {"type": "slot", "count": 8, "with": [{"type": "core", "count": 1}]}
+                ],
+            }
+        ]
+    }
+    assert count_cores(node_slot_core) == 8
+
+    # counts multiply down the tree
+    socketed = {
+        "resources": [
+            {
+                "type": "node",
+                "count": 2,
+                "with": [
+                    {
+                        "type": "socket",
+                        "count": 2,
+                        "with": [
+                            {
+                                "type": "slot",
+                                "count": 4,
+                                "with": [{"type": "core", "count": 1}],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    assert count_cores(socketed) == 16
+
+    # the qpu is not a core, so a scout jobspec counts as one
+    scout = {
+        "resources": [
+            {"type": "slot", "count": 1, "with": [{"type": "core", "count": 1}]},
+            {
+                "type": "qdevice_ibm",
+                "count": 1,
+                "with": [{"type": "qpu", "count": 1, "exclusive": True}],
+            },
+        ]
+    }
+    assert count_cores(scout) == 1
+
+    assert count_cores({"resources": []}) == 0
+    assert count_cores({}) == 0
+
+
+def test_count_cores_takes_the_minimum_of_a_range():
+    """A range means the job may get more, but only the minimum is promised."""
+    from flux_quantum.qresource import count_cores
+
+    ranged = {
+        "resources": [
+            {
+                "type": "slot",
+                "count": {"min": 2, "max": 8},
+                "with": [{"type": "core", "count": 1}],
+            }
+        ]
+    }
+    assert count_cores(ranged) == 2

@@ -20,21 +20,20 @@ flux submit --help 2>&1 | grep -E 'quantum' || { echo "FAIL: CLI plugin not disc
 
 echo ""
 echo "=== 1. load fluxion + qmanager (normal acquire, no load-file) ==="
-flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
-flux module remove -f sched-fluxion-resource 2>/dev/null || true
-flux module remove -f sched-simple 2>/dev/null || true
-flux module load sched-fluxion-resource
-flux module load sched-fluxion-qmanager
+# fluxion with the coschedule policy and without feasibility, see fluxion.sh
+. "$HERE/tests/integration/fluxion.sh"
+ensure_fluxion || { echo "FAIL could not load fluxion"; exit 1; }
 echo "fluxion + qmanager loaded"
 
 echo ""
 echo "=== 2. ONE quantum submit -> plugin submits held classical AND scout ==="
 # the plugin wraps the user command, so do not pre-wrap it here. stdout is the
 # scout id and stderr carries the held classical job id
-# a vendor option, so this value must flow from the CLI through the plugin
-# and scout to the backend and into the classical environment
+# a mock tuning variable, so this value must flow from the submit
+# environment through the plugin and scout to the backend and into the
+# classical environment
 FORCED="mocksess-$$"
-scout_id=$(flux submit --quantum-vendor mock --quantum-mock-session "$FORCED" \
+scout_id=$(FLUX_QUANTUM_MOCK_SESSION="$FORCED" flux submit --quantum-vendor mock \
     -n1 \
     -- sh -c 'echo QUANTUM_SESSION=$QUANTUM_SESSION_ID' 2>"$ERR")
 cat "$ERR" >&2
@@ -51,7 +50,7 @@ if [ -n "$main_id" ]; then
         out=$(flux job attach "$main_id" </dev/null 2>&1)
         if echo "$out" | grep -q "QUANTUM_SESSION=$FORCED"; then
             echo "PASS: classical ran with the VENDOR-SUPPLIED session ($FORCED)"
-            echo "      (--quantum-mock-session flowed CLI -> backend.open_session)"
+            echo "      (FLUX_QUANTUM_MOCK_SESSION flowed submit env -> backend.open_session)"
         elif echo "$out" | grep -qE 'QUANTUM_SESSION=.+'; then
             echo "FAIL: got a session but NOT the vendor option value ($FORCED):"
             echo "$out" | grep 'QUANTUM_SESSION='; rc=1
@@ -89,6 +88,7 @@ fi
 
 echo "=== 5. graceful teardown (remove fluxion so shutdown is clean) ==="
 flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
+flux module remove -f sched-fluxion-feasibility 2>/dev/null || true
 flux module remove -f sched-fluxion-resource 2>/dev/null || true
 
 rm -f "$ERR"

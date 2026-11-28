@@ -1,0 +1,65 @@
+#!/bin/bash
+# The initial program of the instance flux-quantum-start starts. Confirms the
+# scheduler is fluxion with the quantum plugin loaded, adds the vendor devices
+# to the graph, and then runs the command given, or a shell.
+#
+# The graph has to be populated before any job holds resources. Growing it
+# under running jobs corrupts fluxion, so this is the one place it happens.
+set -u
+VENDORS=${VENDORS:-ibm,mock,braket,ionq}
+QPUS=${QPUS:-2}
+
+say() { echo "flux-quantum-init: $*" >&2; }
+
+# rc1 loads fluxion from /etc/flux/rc1.d, or flux modprobe from
+# /etc/flux/modprobe, depending on the flux-core. If neither happened the
+# instance is on sched-simple, which cannot hold a job, so load fluxion by
+# hand in dependency order.
+if ! flux module list | grep -q sched-fluxion-qmanager; then
+    say "fluxion is not loaded, loading it now"
+    flux module remove -f sched-simple 2>/dev/null || true
+    flux module load sched-fluxion-resource load-allowlist=node,core,gpu
+    flux module load sched-fluxion-qmanager
+fi
+
+# The feasibility module keeps its own copy of the graph, and add_subgraph
+# only grows sched-fluxion-resource's. With it loaded every quantum submit is
+# refused as unsatisfiable, because feasibility.check has never heard of a
+# qdevice, and reloading it does not help since it re-reads the original R.
+# The hold branch's own device test and the flux-quantum CI run fluxion
+# without it, so it goes. KEEP_FEASIBILITY=1 leaves it for experiments.
+if [ -z "${KEEP_FEASIBILITY:-}" ] && flux module list | grep -q sched-fluxion-feasibility; then
+    say "removing sched-fluxion-feasibility, its private graph never sees the vendor devices"
+    flux module remove -f sched-fluxion-feasibility
+fi
+
+policy=$(flux config get sched-fluxion-qmanager.queue-policy 2>/dev/null || echo "?")
+[ "$policy" = coschedule ] || say "WARNING queue policy is '$policy', not coschedule. Held jobs will not reserve"
+
+if ! flux jobtap list 2>/dev/null | grep -q quantum; then
+    say "WARNING the quantum jobtap plugin is not loaded, see flux dmesg"
+fi
+
+# shellcheck disable=SC2086
+if ! flux python -m flux_quantum.populate ${VENDORS//,/ } --qpus "$QPUS"; then
+    say "WARNING populate failed, a quantum submit will be refused for want of a qdevice"
+fi
+
+if [ "$(flux getattr size)" -gt 1 ] 2>/dev/null; then
+    say "size $(flux getattr size), the scout and the classical may land on different ranks"
+fi
+say "ready. flux-quantum-check verifies the stack, flux-quantum-demo mock runs a pair"
+
+if [ $# -eq 0 ]; then
+    bash
+else
+    "$@"
+fi
+rc=$?
+
+# remove fluxion in reverse dependency order so the instance shuts down
+# without the modules complaining that resource.acquire went away under them
+flux module remove -f sched-fluxion-qmanager 2>/dev/null || true
+flux module remove -f sched-fluxion-feasibility 2>/dev/null || true
+flux module remove -f sched-fluxion-resource 2>/dev/null || true
+exit "$rc"

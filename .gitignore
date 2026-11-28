@@ -1,2 +1,25 @@
 dist
 *.egg-info
+
+# never commit filled in credentials
+.env
+*.env
+!env.example
+
+# build and python artifacts
+__pycache__/
+*.pyc
+*.so
+
+# a sibling checkout the experiments live in
+flux-quantum-experiments/
+
+# sibling checkouts that live inside this workspace, each its own repo
+flux-sched/
+flux-tutorials/
+fluence/
+Tutorials/
+
+# scratch logs
+experiments/forte/campaign.log
+flux-quantum-experiments/

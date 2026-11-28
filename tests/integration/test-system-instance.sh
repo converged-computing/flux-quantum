@@ -28,11 +28,17 @@ flux submit --help 2>&1 | grep -q -- --quantum-vendor || {
     echo "FAIL: no --quantum options. Is FLUX_CLI_PLUGINPATH set?"; exit 1; }
 flux submit --help 2>&1 | grep -- --quantum- | sed 's/^/    /'
 
+# Remember how much log there is before we start. This is a long lived
+# instance, so everything since boot is still in the ring buffer and an
+# unrelated error from an hour ago is not our problem. Counting lines rather
+# than parsing timestamps keeps this working whatever the log format is.
+DMESG_MARK=$(flux dmesg 2>/dev/null | wc -l)
+
 echo ""
 echo "=== 4. one quantum submit -> held classical + scout ==="
 SID="systest-$(date +%s)"
 ERR=$(mktemp)
-scout=$(flux submit --quantum-vendor mock --quantum-mock-session "$SID" -n1 \
+scout=$(FLUX_QUANTUM_MOCK_SESSION="$SID" flux submit --quantum-vendor mock -n1 \
         -- sh -c 'echo QUANTUM_SESSION=$QUANTUM_SESSION_ID' 2>"$ERR")
 sed 's/^/    /' "$ERR"
 main=$(grep -oE 'held classical job [0-9]+' "$ERR" | awk '{print $NF}')
@@ -91,9 +97,61 @@ fi
 
 echo ""
 echo "=== 8. instance log errors during the run ==="
-errs=$(flux dmesg 2>&1 | grep -iE "\.err\[[0-9]+\]|: error:|fatal" || true)
+# only what was logged after the mark, and rexec complaints are not ours. They
+# come from flux exec, which the scout and the classical never use.
+errs=$(flux dmesg 2>/dev/null | tail -n +$((DMESG_MARK + 1)) \
+    | grep -iE "\.err\[[0-9]+\]|: error:|fatal" \
+    | grep -v "rexec" || true)
 if [ -n "$errs" ]; then
     echo "FAIL: errors logged:"; echo "$errs" | sed 's/^/    /'; rc=1
+fi
+
+echo ""
+echo "=== 9. feasibility knows the vendor devices ==="
+# The feasibility module bootstraps its own graph from the notify stream,
+# which carries the initial graph - the static scheduling graph, qdevices
+# included. Prove it both ways: a scout for a configured vendor is feasible,
+# one for an unknown vendor is refused.
+if ! flux module list | grep -q sched-fluxion-feasibility; then
+    echo "    SKIP: sched-fluxion-feasibility is NOT loaded, so the"
+    echo "    SKIP: feasibility check is NOT being tested. Load it (it"
+    echo "    SKIP: bootstraps itself from notify) and rerun this test."
+else
+    flux python - <<'PYEOF' || rc=1
+import errno
+import sys
+
+import flux
+from flux_quantum.launch import build_scout_jobspec
+
+handle = flux.Flux()
+
+
+def check(vendor):
+    """errno from feasibility.check, None when the scout is feasible."""
+    try:
+        handle.rpc(
+            "feasibility.check", {"jobspec": build_scout_jobspec(vendor, 1)}
+        ).get()
+        return None
+    except OSError as exc:
+        return exc.errno
+
+
+got = check("mock")
+if got is not None:
+    print("    FAIL: a mock scout is called unsatisfiable (errno {}). The".format(got))
+    print("    feasibility graph is missing the configured vendor devices")
+    sys.exit(1)
+print("    a mock scout is feasible")
+
+got = check("nosuchvendor")
+if got in (errno.ENODEV, errno.EINVAL):
+    print("    an unknown vendor is refused (errno {})".format(got))
+    sys.exit(0)
+print("    FAIL: an unknown vendor was not refused (got errno {})".format(got))
+sys.exit(1)
+PYEOF
 fi
 
 echo ""

@@ -9,7 +9,7 @@ import pytest
 
 from flux_quantum.backends.base import Backend
 from flux_quantum.scout import SESSION_KEY, post_session, wait_for_job
-from flux_quantum.scout import _install_signal_handlers
+from flux_quantum.scout import _install_signal_handlers, Signalled, run
 from flux_quantum.wrap import read_session
 
 
@@ -91,9 +91,6 @@ def test_backend_close_session_defaults_to_noop():
     class _Bare(Backend):
         name = "bare"
 
-        def credentials_present(self):
-            return True, "ok"
-
         def probe(self):
             return None
 
@@ -145,3 +142,183 @@ def test_signal_handlers_unwind_so_the_session_is_closed():
         assert closed == ["closed"]
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+def test_abort_cancels_the_held_job():
+    """A failure before the release must not leave the classical held forever."""
+    from flux_quantum.scout import abort_held
+
+    cancelled = {}
+
+    def fake_cancel(handle, jobid, why):
+        cancelled["jobid"] = jobid
+        cancelled["why"] = why
+
+    with pytest.raises(SystemExit):
+        abort_held(None, 4021041664, "opening ibm session failed", cancel=fake_cancel)
+    assert cancelled["jobid"] == 4021041664
+    assert "opening ibm session failed" in cancelled["why"]
+
+
+def test_abort_still_exits_when_the_cancel_fails():
+    """A broker we cannot reach must not turn into a hang."""
+    from flux_quantum.scout import abort_held
+
+    def boom(handle, jobid, why):
+        raise RuntimeError("no broker")
+
+    with pytest.raises(SystemExit):
+        abort_held(None, 1, "whatever", cancel=boom)
+
+
+def test_memo_carries_a_durable_release_marker():
+    """A release lives only in scheduler memory, so a qmanager restart would
+    park the job again. The eventlog survives, and fluxion reads it there."""
+    from flux_quantum.scout import post_session, SESSION_KEY
+
+    sent = {}
+
+    class Fut:
+        def get(self):
+            return None
+
+    def rpc(topic, payload):
+        sent["topic"] = topic
+        sent["payload"] = payload
+        return Fut()
+
+    post_session(None, 4021041664, "sess-1", rpc=rpc)
+    memo = sent["payload"]["memo"]
+    assert memo[SESSION_KEY] == "sess-1"
+    assert memo["released"] == 1
+    assert sent["payload"]["id"] == 4021041664
+
+
+def test_sigalrm_unwinds_too():
+    """flux sends SIGALRM at the walltime, so it has to unwind like SIGTERM."""
+    previous = signal.getsignal(signal.SIGALRM)
+    try:
+        _install_signal_handlers()
+        with pytest.raises(Signalled):
+            os.kill(os.getpid(), signal.SIGALRM)
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+
+
+class _Vendor:
+    """A backend whose wait can be scripted to end the way a signal would."""
+
+    def __init__(self, wait=None):
+        self.calls = []
+        self._wait = wait
+
+    def open_session(self, opts):
+        self.calls.append("open")
+        return "S1"
+
+    def wait_for_priority(self, opts):
+        self.calls.append("wait")
+        if self._wait is not None:
+            raise self._wait
+        return True, "ours"
+
+    def session_id(self, opened):
+        return opened
+
+    def close_session(self, session):
+        self.calls.append(("close", session))
+
+
+def _calls():
+    log = []
+    fns = dict(
+        cancel=lambda h, j, why: log.append(("cancel", j, why)),
+        release=lambda h, j: log.append(("release", j)),
+        post=lambda h, j, s: log.append(("post", j, s)),
+    )
+    return log, fns
+
+
+def test_a_signal_while_waiting_closes_and_cancels():
+    """The walltime ran out, or the scout was cancelled, while it waited for
+    the vendor. The session must be closed and the held job cancelled, or
+    the classical waits forever and the session bills for nobody."""
+    log, fns = _calls()
+    vendor = _Vendor(wait=Signalled("quantum-scout: received signal 14 (SIGALRM)"))
+    with pytest.raises(SystemExit):
+        run(None, 77, "ibm", vendor, {}, **fns)
+    assert vendor.calls == ["open", "wait", ("close", "S1")]
+    assert [x[0] for x in log] == ["cancel"]
+    assert log[0][1] == 77 and "SIGALRM" in log[0][2]
+
+
+def test_a_signal_after_release_closes_but_does_not_cancel():
+    """Once released the classical is running and is not ours to cancel."""
+    log, fns = _calls()
+    vendor = _Vendor()
+
+    def waiter(handle, jobid, name, raiseJobException=True):
+        raise Signalled("quantum-scout: received signal 15 (SIGTERM)")
+
+    with pytest.raises(SystemExit):
+        run(None, 77, "ibm", vendor, {}, waiter=waiter, **fns)
+    assert vendor.calls == ["open", "wait", ("close", "S1")]
+    assert [x[0] for x in log] == ["post", "release"]
+
+
+def test_the_normal_path_holds_then_closes():
+    log, fns = _calls()
+    vendor = _Vendor()
+    run(None, 77, "ibm", vendor, {}, waiter=lambda *a, **k: None, **fns)
+    assert vendor.calls == ["open", "wait", ("close", "S1")]
+    assert [x[0] for x in log] == ["post", "release"]
+    assert log[0][2] == "S1"
+
+
+def test_a_vendor_that_never_becomes_ours_is_closed_and_the_job_cancelled():
+    log, fns = _calls()
+
+    class _Never(_Vendor):
+        def wait_for_priority(self, opts):
+            self.calls.append("wait")
+            return False, "still queued"
+
+    vendor = _Never()
+    with pytest.raises(SystemExit):
+        run(None, 77, "ibm", vendor, {}, **fns)
+    assert vendor.calls == ["open", "wait", ("close", "S1")]
+    assert [x[0] for x in log] == ["cancel"]
+
+
+def test_a_job_that_was_never_held_is_not_cancelled():
+    """Under a queue policy that ignores holds the classical is scheduled
+    before the release, which then fails with EINVAL. It is running with the
+    session already, so it must not be cancelled."""
+    import errno as _errno
+
+    log, fns = _calls()
+
+    def release(h, j):
+        raise OSError(_errno.EINVAL, "Invalid argument")
+
+    fns["release"] = release
+    vendor = _Vendor()
+    run(None, 77, "ibm", vendor, {}, waiter=lambda *a, **k: None, **fns)
+    assert [x[0] for x in log] == ["post"]
+    assert vendor.calls == ["open", "wait", ("close", "S1")]
+
+
+def test_any_other_release_failure_cancels():
+    import errno as _errno
+
+    log, fns = _calls()
+
+    def release(h, j):
+        raise OSError(_errno.ENOENT, "No such job")
+
+    fns["release"] = release
+    vendor = _Vendor()
+    with pytest.raises(SystemExit):
+        run(None, 77, "ibm", vendor, {}, **fns)
+    assert [x[0] for x in log] == ["post", "cancel"]
+    assert vendor.calls == ["open", "wait", ("close", "S1")]

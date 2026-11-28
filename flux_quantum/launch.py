@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-# Build and submit the scout job.
-#
-# The scout asks for a small classical foothold and the vendor device, so
-# fluxion co-allocates a core and a qpu. That match is the coschedule. When the
-# scout runs it opens the vendor session and releases the held classical job.
-#
-# The mock only replaces the vendor API. The graph match is real, so if
-# qdevice_<vendor> -> qpu is missing the scout is unsatisfiable and never runs.
+# Build the scout jobspec. The scout asks for a small classical foothold and
+# the vendor device, so fluxion co-allocates a core and a qpu. Even with the
+# mock the graph match is real, so a missing qdevice makes it unsatisfiable.
 import argparse
 import json
 import os
 
 from flux_quantum import qresource
+
+try:
+    import flux
+    from flux.job import submit
+except ImportError:
+    flux = submit = None
 
 
 def build_scout_jobspec(
@@ -61,6 +62,14 @@ def build_scout_jobspec(
                 }
             ],
         }
+    # the jobtap plugin cancels the held classical if its scout dies without
+    # releasing it, and this attribute is how it knows whose scout this is.
+    # No vendor key here, or the plugin would take the scout for a classical.
+    attributes = {"system": {"duration": duration}}
+    try:
+        attributes["system"]["quantum"] = {"partner": int(hold_job)}
+    except (TypeError, ValueError):
+        pass  # a placeholder id (dry run), nothing to guard
     return {
         "version": 1,
         "resources": [
@@ -69,17 +78,9 @@ def build_scout_jobspec(
             # R. One shape source, shared with the graph populator.
             qresource.jobspec_resource(vendor),
         ],
-        "attributes": {"system": {"duration": duration}},
+        "attributes": attributes,
         "tasks": [{"command": command, "slot": "scout", "count": {"per_slot": 1}}],
     }
-
-
-def submit_scout(handle, vendor, hold_job, ncores=1, duration=0, session=None):
-    """Submit the scout job and return the flux JobID."""
-    from flux.job import submit
-
-    jobspec = build_scout_jobspec(vendor, hold_job, ncores, duration, session=session)
-    return submit(handle, json.dumps(jobspec))
 
 
 def main():
@@ -124,9 +125,11 @@ def main():
         print(json.dumps(jobspec, indent=2))
         return
 
-    import flux
-    from flux.job import submit
-
+    if flux is None:
+        raise SystemExit(
+            "quantum-scout-launch: the flux bindings are not importable, run "
+            "under flux python"
+        )
     h = flux.Flux()
     print(submit(h, json.dumps(jobspec)))
 

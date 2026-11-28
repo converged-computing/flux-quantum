@@ -1,15 +1,15 @@
 # Build the quantum jobtap plugin against an installed flux-core.
-# Requires flux-core development headers (flux/jobtap.h) and jansson.
+# Requires flux-core development headers (flux/jobtap.h, flux/idset.h) and jansson.
 #
 #   make            # builds quantum.so
 #   make clean
 #
 # If pkg-config cannot find flux-core, set FLUX_CFLAGS / FLUX_LIBS by hand,
-# e.g.  make FLUX_CFLAGS="-I/usr/include" FLUX_LIBS="-lflux-core -ljansson"
+# e.g.  make FLUX_CFLAGS="-I/usr/include" FLUX_LIBS="-lflux-core -lflux-idset -ljansson"
 
 CC        ?= cc
 FLUX_CFLAGS ?= $(shell pkg-config --cflags flux-core 2>/dev/null)
-FLUX_LIBS   ?= $(shell pkg-config --libs flux-core 2>/dev/null) -ljansson
+FLUX_LIBS   ?= $(shell pkg-config --libs flux-core 2>/dev/null) -lflux-idset -ljansson
 CFLAGS    ?= -Wall -Werror -fPIC -O2
 
 quantum.so: quantum.c

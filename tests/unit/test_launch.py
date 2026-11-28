@@ -60,3 +60,23 @@ def test_build_does_not_import_flux():
     launch = importlib.import_module("flux_quantum.launch")
     js = launch.build_scout_jobspec("mock", 42)
     assert js["version"] == 1
+
+
+def test_scout_jobspec_names_its_partner():
+    """The jobtap plugin cancels the held classical when its scout dies
+    without releasing it, and the partner attribute is the only way it can
+    know whose scout died. A scout whose shell was killed hard (seen in
+    production: input.kvs FATAL mid-wait) runs no cleanup of its own."""
+    launch = importlib.import_module("flux_quantum.launch")
+    js = launch.build_scout_jobspec("mock", 123456789)
+    assert js["attributes"]["system"]["quantum"] == {"partner": 123456789}
+    # no vendor key, or the plugin would take the scout for a classical
+    assert "vendor" not in js["attributes"]["system"]["quantum"]
+
+
+def test_scout_jobspec_placeholder_partner_is_omitted():
+    """A dry run rewrites the jobspec with a placeholder id, and a partner
+    that is not a real jobid must not be stamped at all."""
+    launch = importlib.import_module("flux_quantum.launch")
+    js = launch.build_scout_jobspec("mock", "JOBID")
+    assert "quantum" not in js["attributes"]["system"]

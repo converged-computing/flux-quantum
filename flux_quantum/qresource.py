@@ -8,11 +8,11 @@
 """The quantum resource shape, in one place.
 
 A vendor device is qdevice_<vendor> -> qpu, hung off the graph root as a
-sibling of rack, so it sits in a different subtree than the node cores.
+sibling of the nodes, so it sits in a different subtree than the node cores.
 
-Both the jobspec request and the add_subgraph payload are built from here, so
-the graph and the jobspec cannot disagree on type name, nesting or
-exclusivity. No flux imports, just dicts.
+Both the jobspec request and the static scheduling graph (schedjgf) are built
+from here, so the graph and the jobspec cannot disagree on type name, nesting
+or exclusivity. No flux imports, just dicts.
 """
 
 QDEVICE_PREFIX = "qdevice_"
@@ -27,35 +27,13 @@ def qdevice_type(vendor):
 def jobspec_resource(vendor, nqpus=1):
     """A scout jobspec resources entry for the vendor device.
 
-    The qpu must be exclusive. Fluxion only adds a planner span and emits a
-    leaf device into R when it is asked for exclusively, since upd_plan calls
-    planner_add_span only inside the excl branch. Ask for it any other way and
-    it is matched but then dropped from the allocation.
+    The qpu must be exclusive. Fluxion only writes a leaf device into R when
+    it is asked for exclusively, otherwise it is matched and then dropped.
     """
     return {
         "type": qdevice_type(vendor),
         "count": 1,
         "with": [{"type": QPU, "count": nqpus, "exclusive": True}],
-    }
-
-
-def _vertex(vid, vtype, path, vendor):
-    return {
-        "id": str(vid),
-        "metadata": {
-            "type": vtype,
-            "rank": -1,
-            "paths": {"containment": path},
-            "properties": {vendor: ""},
-        },
-    }
-
-
-def _edge(src, tgt):
-    return {
-        "source": str(src),
-        "target": str(tgt),
-        "metadata": {"subsystem": "containment"},
     }
 
 
@@ -66,39 +44,6 @@ def find_root(graph):
     if len(roots) != 1:
         raise ValueError("expected exactly 1 root, found %d" % len(roots))
     return roots[0]
-
-
-def graph_subgraph(live_graph, vendors, qpus=1):
-    """Build an add_subgraph payload planting qdevice_<vendor> -> qpu under the
-    live graph root.
-
-    The root is copied verbatim so the fluxion JGF reader matches it on
-    containment path and rank, then attaches rather than duplicating it.
-    """
-    if isinstance(vendors, str):
-        vendors = [vendors]
-    root = find_root(live_graph)
-    root_id = root["id"]
-    root_path = root["metadata"]["paths"]["containment"]
-    next_id = max(int(n["id"]) for n in live_graph["nodes"]) + 1
-
-    nodes = [root]  # verbatim, so it is matched on path and rank
-    edges = []
-    for vendor in vendors:
-        qd_id = next_id
-        next_id += 1
-        qd_type = qdevice_type(vendor)
-        qd_path = "{}/{}0".format(root_path, qd_type)
-        nodes.append(_vertex(qd_id, qd_type, qd_path, vendor))
-        edges.append(_edge(root_id, qd_id))
-        for q in range(qpus):
-            qpu_id = next_id
-            next_id += 1
-            nodes.append(
-                _vertex(qpu_id, QPU, "{}/{}{}".format(qd_path, QPU, q), vendor)
-            )
-            edges.append(_edge(qd_id, qpu_id))
-    return {"graph": {"nodes": nodes, "edges": edges}}
 
 
 def _node_to_core_intermediates(graph):
@@ -144,3 +89,21 @@ def classical_resource(live_graph, ncores=1, label="scout"):
     for t in reversed(intermediates):
         inner = {"type": t, "count": 1, "with": [inner]}
     return {"type": "node", "count": 1, "with": [inner]}
+
+
+def count_cores(jobspec):
+    """Total cores a v1 jobspec asks for, multiplying counts down the tree."""
+
+    def walk(entries, factor):
+        total = 0
+        for entry in entries or []:
+            count = entry.get("count", 1)
+            if isinstance(count, dict):  # a range, take the minimum we must get
+                count = count.get("min", 1)
+            n = factor * int(count)
+            if entry.get("type") == "core":
+                total += n
+            total += walk(entry.get("with"), n)
+        return total
+
+    return walk(jobspec.get("resources"), 1)
